@@ -86,7 +86,7 @@ struct Credentials {
     }
 }
 
-// MARK: - launchd 자동 실행 (앱 실행 파일을 --auto 로 10분마다 깨움, 실제 확인은 설정한 시각마다 1번)
+// MARK: - launchd 자동 실행 (설정한 시각과 그 10·20분 뒤(일시 오류 재시도용)에만 --auto 로 깨움, 실제 확인은 시각마다 1번)
 
 struct LaunchAgent {
     let label: String
@@ -114,6 +114,19 @@ struct LaunchAgent {
         ["/bin/sh", "-c", LaunchAgent.runner, exe, plistPath, label]
     }
 
+    /// 확인 시각마다 그 시각 + 10분 + 20분 (일시 오류면 다음 칸에서 재시도, 이미 확인했으면 바로 종료).
+    /// Mac이 잠자고 있어서 놓친 시각은 launchd가 깨어난 뒤 1번 실행해 줌.
+    static func desiredCalendar(_ times: [Int] = Schedule.times) -> [[String: Int]] {
+        Array(Set(times.flatMap { t in [0, 10, 20].map { (t + $0) % 1440 } })).sorted()
+            .map { ["Hour": $0 / 60, "Minute": $0 % 60] }
+    }
+
+    private var plistUpToDate: Bool {
+        guard let d = NSDictionary(contentsOfFile: plistPath), d["StartInterval"] == nil,
+              let cal = d["StartCalendarInterval"] as? [[String: Int]] else { return false }
+        return cal == LaunchAgent.desiredCalendar()
+    }
+
     /// 현재 앱 위치로 plist를 쓰고 등록. 실패하면 오류 메시지.
     func install() async -> String? {
         guard let exe = Bundle.main.executablePath else { return "실행 파일 경로를 모름" }
@@ -121,7 +134,7 @@ struct LaunchAgent {
             "Label": label,
             "ProgramArguments": desiredArguments(exe),
             "RunAtLoad": false,
-            "StartInterval": 600,
+            "StartCalendarInterval": LaunchAgent.desiredCalendar(),
             "ProcessType": "Interactive",
         ]
         do {
@@ -148,7 +161,7 @@ struct LaunchAgent {
         guard let exe = Bundle.main.executablePath else { return }
         if exists {
             UserDefaults.standard.set(true, forKey: "autoEnabled")
-            if programArguments() != desiredArguments(exe) { _ = await install() }
+            if programArguments() != desiredArguments(exe) || !plistUpToDate { _ = await install() }
         } else if UserDefaults.standard.bool(forKey: "autoEnabled") {
             _ = await install()
         }
@@ -230,7 +243,7 @@ enum Schedule {
 }
 
 /// 자동 실행 회차 관리: 설정한 시각이 지나면 그 회차를 1번 실행.
-/// (launchd가 10분마다 깨우므로 설정 시각 후 10분 안에, 그 시각에 Mac이 잠자고 있었으면 깨어난 뒤 실행)
+/// (launchd가 설정 시각에 깨움. 그 시각에 Mac이 잠자고 있었으면 깨어난 뒤 실행)
 struct DailyGuard {
     private let d = UserDefaults.standard
 
@@ -788,7 +801,10 @@ struct AutoRunSection: View {
         } header: {
             Text("자동 실행")
         }
-        .onChange(of: times) { _, t in Schedule.times = t }
+        .onChange(of: times) { _, t in
+            Schedule.times = t
+            if on { Task { err = await agent.install() ?? "" } }  // 깨우는 시각도 같이 바꿈
+        }
         .task { on = await agent.isLoaded() }
     }
 }
