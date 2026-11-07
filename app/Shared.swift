@@ -318,6 +318,7 @@ enum DateUtil {
 
     static func today() -> String { fmt("yyyy-MM-dd", Date()) }
     static func ymd(_ d: Date) -> String { fmt("yyyy-MM-dd", d) }
+    static func md(_ d: Date) -> String { fmt("M/d", d) }
     static func stamp(_ d: Date) -> String { fmt("yyyy-MM-dd HH:mm:ss", d) }
     static func label(_ d: Date, time: Bool = true) -> String { fmt(time ? "M/d(E) HH:mm" : "M/d(E)", d) }
 

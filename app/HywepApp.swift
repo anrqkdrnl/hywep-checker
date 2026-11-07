@@ -27,8 +27,8 @@ struct Posting: Codable, Identifiable, Hashable {
     var daysLeft: Int { deadlineDate.map(DateUtil.dayDiff) ?? 9999 }
     var foundLabel: String {
         if is_new { return "NEW" }
-        if found == "base" { return "기준" }
-        return DateUtil.parse(found).map { DateUtil.label($0, time: false) } ?? found
+        let f = found == "base" ? HyEngine.baselineDay : found
+        return DateUtil.parse(f).map(DateUtil.md) ?? f
     }
     var shortSched: String {
         // "2026년도 겨울학기 단기 현장실습 (…)" → "26 겨울 단기"
@@ -155,7 +155,9 @@ enum HyEngine {
         var seen = reset ? [:] : (hyFiles.load([String: String].self, hySeenFile) ?? [:])
         let today = DateUtil.today()
         let firstRun = seen.isEmpty
-        for r in rows where seen[r.jid] == nil { seen[r.jid] = firstRun ? "base" : today }
+        // 예전 형식("base") → 처음 기준을 잡은 날짜
+        for (k, v) in seen where v == "base" { seen[k] = baselineDay }
+        for r in rows where seen[r.jid] == nil { seen[r.jid] = today }
         try hyFiles.save(seen, hySeenFile)
 
         let out = rows.map { r -> Posting in
@@ -169,6 +171,13 @@ enum HyEngine {
         try hyFiles.save(data, hyResultFile)
         return data
     }
+
+    /// 예전 형식 "base"(처음 기준 목록)의 날짜: 예전 Python 버전 기록 파일을 만든 날, 없으면 오늘
+    nonisolated static let baselineDay: String = {
+        let p = NSHomeDirectory() + "/.hywep_check/seen.json"
+        if let d = (try? FileManager.default.attributesOfItem(atPath: p))?[.creationDate] as? Date { return DateUtil.ymd(d) }
+        return DateUtil.today()
+    }()
 
     /// 예전 Python 버전의 기록이 있으면 가져와서 NEW 기준을 이어감
     static func importLegacySeen() {
