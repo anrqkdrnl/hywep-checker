@@ -188,26 +188,67 @@ struct AppFiles {
 
 // MARK: - 하루 1번 가드 + 실패 횟수 (UserDefaults)
 
+/// 자동 확인 시각 (하루 여러 번 가능). 자정부터의 분(0~1439), 한국 시간 기준.
+enum Schedule {
+    static let key = "checkTimes"
+    static let defaultTimes = [5 * 60]
+    static let maxCount = 6
+
+    static var times: [Int] {
+        get {
+            let a = (UserDefaults.standard.array(forKey: key) as? [Int]) ?? []
+            let s = Array(Set(a.filter { (0..<1440).contains($0) })).sorted()
+            return s.isEmpty ? defaultTimes : s
+        }
+        set { UserDefaults.standard.set(Array(Set(newValue)).sorted(), forKey: key) }
+    }
+
+    static func label(_ m: Int) -> String { String(format: "%02d:%02d", m / 60, m % 60) }
+    static func summary(_ t: [Int] = times) -> String {
+        Array(Set(t)).sorted().map(label).joined(separator: ", ")
+    }
+}
+
+/// 자동 실행 회차 관리: 설정한 시각이 지나면 그 회차를 1번 실행.
+/// (launchd가 10분마다 깨우므로 설정 시각 후 10분 안에, 그 시각에 Mac이 잠자고 있었으면 깨어난 뒤 실행)
 struct DailyGuard {
     private let d = UserDefaults.standard
 
-    var lastRun: String? { d.string(forKey: "lastRun") }
+    /// 오늘 이미 지난 확인 시각 중 가장 최근 것
+    func dueSlot(now: Date = Date()) -> Date? {
+        let start = DateUtil.calendar.startOfDay(for: now)
+        return Schedule.times.map { start.addingTimeInterval(TimeInterval($0 * 60)) }.filter { $0 <= now }.max()
+    }
 
-    func shouldRun() -> Bool {
-        DateUtil.calendar.component(.hour, from: Date()) >= 5 && lastRun != DateUtil.today()
+    var lastRunAt: Date? {
+        if let t = d.object(forKey: "lastRunAt") as? Date { return t }
+        // 예전 버전(날짜만 저장, 05시 고정) 호환
+        if let s = d.string(forKey: "lastRun"), let day = DateUtil.parse(s) { return day.addingTimeInterval(5 * 3600) }
+        return nil
+    }
+
+    func shouldRun(now: Date = Date()) -> Bool {
+        if d.string(forKey: "stopDate") == DateUtil.today() { return false }
+        guard let slot = dueSlot(now: now) else { return false }
+        return (lastRunAt ?? .distantPast) < slot
     }
 
     func markDone() {
-        d.set(DateUtil.today(), forKey: "lastRun")
-        d.removeObject(forKey: "failDate")
-        d.removeObject(forKey: "failCount")
+        d.set(Date(), forKey: "lastRunAt")
+        for k in ["lastRun", "failSlot", "failCount", "stopDate"] { d.removeObject(forKey: k) }
     }
 
-    /// 오늘 실패 횟수 (+1 한 값)
+    /// 로그인 거부 등: 반복하면 계정이 잠길 수 있어 오늘 남은 회차는 건너뜀 (직접 확인에 성공하면 풀림)
+    func stopForToday() {
+        markDone()
+        d.set(DateUtil.today(), forKey: "stopDate")
+    }
+
+    /// 이번 회차 실패 횟수 (+1 한 값)
     func recordFailure() -> Int {
-        let t = DateUtil.today()
-        let n = (d.string(forKey: "failDate") == t ? d.integer(forKey: "failCount") : 0) + 1
-        d.set(t, forKey: "failDate")
+        let slot = dueSlot().map(DateUtil.stamp) ?? DateUtil.today()
+        let n = (d.string(forKey: "failSlot") == slot ? d.integer(forKey: "failCount") : 0) + 1
+        d.set(slot, forKey: "failSlot")
         d.set(n, forKey: "failCount")
         return n
     }
@@ -608,12 +649,66 @@ struct CredentialSection: View {
     }
 }
 
+/// 자동 확인 시각 편집 (여러 개)
+struct ScheduleEditor: View {
+    @Binding var times: [Int]
+    @State private var items: [Item] = []
+
+    private struct Item: Identifiable { let id = UUID(); var minutes: Int }
+
+    var body: some View {
+        Group {
+            ForEach($items) { $item in
+                HStack {
+                    DatePicker("확인 시각", selection: dateBinding($item.minutes), displayedComponents: .hourAndMinute)
+                        .environment(\.timeZone, DateUtil.kst)
+                        .environment(\.locale, Locale(identifier: "ko_KR"))
+                    if items.count > 1 {
+                        Button { items.removeAll { $0.id == item.id }; save() } label: {
+                            Image(systemName: "minus.circle.fill").foregroundStyle(.red)
+                        }
+                        .buttonStyle(.borderless).help("이 시각 빼기")
+                    }
+                }
+            }
+            if items.count < Schedule.maxCount {
+                Button {
+                    let last = items.map(\.minutes).max() ?? 0
+                    var m = (last + 6 * 60) % 1440
+                    while items.contains(where: { $0.minutes == m }) { m = (m + 60) % 1440 }
+                    items.append(Item(minutes: m)); save()
+                } label: { Label("시각 추가", systemImage: "plus.circle") }
+                .buttonStyle(.borderless)
+            }
+        }
+        .onAppear { items = times.map { Item(minutes: $0) } }
+    }
+
+    private func dateBinding(_ m: Binding<Int>) -> Binding<Date> {
+        Binding(
+            get: { DateUtil.calendar.startOfDay(for: Date()).addingTimeInterval(TimeInterval(m.wrappedValue * 60)) },
+            set: { d in
+                let c = DateUtil.calendar.dateComponents([.hour, .minute], from: d)
+                m.wrappedValue = (c.hour ?? 0) * 60 + (c.minute ?? 0)
+                save()
+            })
+    }
+
+    private func save() { times = items.map(\.minutes) }
+}
+
+func autoDescription(_ times: [Int], _ action: String) -> String {
+    "매일 \(Schedule.summary(times))에 확인해서 \(action). 그 시각에 Mac이 잠자고 있었으면 깨어난 뒤 처음 쓸 때 확인해."
+}
+
 struct AutoRunSection: View {
     let agent: LaunchAgent
-    let description: String
+    /// 예: "결과 창을 띄워줘"
+    let action: String
     @State private var on = false
     @State private var busy = false
     @State private var err = ""
+    @State private var times = Schedule.times
 
     var body: some View {
         Section {
@@ -625,14 +720,17 @@ struct AutoRunSection: View {
                     busy = false
                 }
             })) {
-                Text("매일 아침 자동 확인")
-                Text(description).font(.caption).foregroundStyle(.secondary)
+                Text("자동 확인")
+                Text(autoDescription(times, action)).font(.caption).foregroundStyle(.secondary)
             }
             .disabled(busy)
             if !err.isEmpty { Text(err).font(.caption).foregroundStyle(.red) }
+            ScheduleEditor(times: $times)
+                .disabled(!on)
         } header: {
             Text("자동 실행")
         }
+        .onChange(of: times) { _, t in Schedule.times = t }
         .task { on = await agent.isLoaded() }
     }
 }
@@ -647,7 +745,7 @@ struct LegacySection: View {
         Group {
             if present {
                 Section {
-                    Text("예전 터미널(Python) 버전의 자동 실행이 아직 켜져 있어. 이 앱과 같이 켜두면 아침 팝업이 두 번 떠.")
+                    Text("예전 터미널(Python) 버전의 자동 실행이 아직 켜져 있어. 이 앱과 같이 켜두면 팝업이 두 번 떠.")
                         .font(.callout)
                     Button("예전 버전 자동 실행 끄기") {
                         Task {
@@ -674,7 +772,8 @@ struct SetupView: View {
     let accountTitle: String
     let creds: Credentials
     let agent: LaunchAgent
-    let autoDescription: String
+    /// 자동 확인 때 하는 일. 예: "결과 창을 띄워줘"
+    let autoAction: String
     /// 아이디/비번으로 실제 로그인 시험
     let testLogin: (String, String) async throws -> Void
     let onFinish: () -> Void
@@ -687,6 +786,7 @@ struct SetupView: View {
     @State private var auto = true
     @State private var notify = true
     @State private var finishing = false
+    @State private var times = Schedule.times
 
     var body: some View {
         VStack(spacing: 0) {
@@ -753,17 +853,18 @@ struct SetupView: View {
             Label("로그인 성공!", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
             Form {
                 Toggle(isOn: $auto) {
-                    Text("매일 아침 자동 확인")
-                    Text(autoDescription).font(.caption).foregroundStyle(.secondary)
+                    Text("자동 확인")
+                    Text(autoDescription(times, autoAction)).font(.caption).foregroundStyle(.secondary)
                 }
+                if auto { ScheduleEditor(times: $times) }
                 Toggle(isOn: $notify) {
                     Text("알림 받기")
                     Text("결과를 알림 센터로도 알려줘요. 다음 화면에서 macOS가 허용 여부를 물어봐요.").font(.caption).foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)
-            .frame(height: 150)
-            Text("나중에 설정(⌘,)에서 언제든 바꿀 수 있어요.").font(.caption).foregroundStyle(.secondary)
+            .frame(height: 250)
+            Text("시각은 나중에 설정(⌘,)에서 언제든 바꿀 수 있어요.").font(.caption).foregroundStyle(.secondary)
             Spacer()
             HStack {
                 Button("이전") { step = 1 }
@@ -771,6 +872,7 @@ struct SetupView: View {
                 Button {
                     finishing = true
                     Task {
+                        Schedule.times = times
                         if auto { _ = await agent.install() } else { await agent.uninstall() }
                         if notify { Notifier.shared.requestPermission() }
                         UserDefaults.standard.set(true, forKey: "setupDone")

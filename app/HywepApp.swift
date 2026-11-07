@@ -474,7 +474,7 @@ struct HySettingsView: View {
     var body: some View {
         Form {
             CredentialSection(title: "한양대 포털 계정", creds: hyCreds)
-            AutoRunSection(agent: hyAgent, description: "매일 05시 이후 Mac을 처음 쓸 때 1번 확인해서, 새 공고가 있으면 창을 띄워줘")
+            AutoRunSection(agent: hyAgent, action: "새 공고가 있으면 창을 띄워줘")
             LegacySection(label: "com.seongsu.hywepcheck", folder: ".hywep_check")
             Section {
                 Button("기준 목록 초기화…", role: .destructive) { confirmReset = true }
@@ -568,11 +568,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let view = SetupView(
             appName: "HY-WEP 체커", icon: "briefcase.fill", tint: .teal,
             features: ["HY-WEP 현장실습 접수중 공고를 한눈에 (검색·정렬·필터)", "새로 올라온 공고에 NEW 표시",
-                       "공고를 클릭하면 상세 내용을 앱 안에서 바로 확인", "매일 아침 자동으로 확인해서 새 공고를 알려줌",
+                       "공고를 클릭하면 상세 내용을 앱 안에서 바로 확인", "정한 시각에 자동으로 확인해서 새 공고를 알려줌",
                        "읽기 전용 — 신청·취소는 절대 건드리지 않음"],
             accountTitle: "HY-WEP 학생 로그인에 쓰는 한양대 포털 계정을 입력해줘.",
             creds: hyCreds, agent: hyAgent,
-            autoDescription: "매일 05시 이후 Mac을 처음 쓸 때 1번 확인해서, 새 공고가 있으면 창을 띄워줘",
+            autoAction: "새 공고가 있으면 창을 띄워줘",
             testLogin: { try await HyEngine.testLogin($0, $1) },
             onFinish: { [weak self] in
                 guard let self else { return }
@@ -584,7 +584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Windows.present(setupWindow!)
     }
 
-    // launchd(--auto): 하루 1번. 새 공고가 있으면 창, 없으면 알림만.
+    // launchd(--auto): 설정한 시각마다 1번. 새 공고가 있으면 창, 없으면 알림만.
     func runAuto() async {
         let guardian = DailyGuard()
         guard UserDefaults.standard.bool(forKey: "setupDone"), guardian.shouldRun(), hyFiles.lock() else {
@@ -598,7 +598,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let d = try await HyEngine.run()
                 guardian.markDone()
                 if d.first_run {
-                    Notifier.shared.post("HY-WEP 체커", "접수중 공고 \(d.total)건을 기준으로 저장했어. 내일부터 새 공고만 알려줄게.")
+                    Notifier.shared.post("HY-WEP 체커", "접수중 공고 \(d.total)건을 기준으로 저장했어. 다음 확인부터 새 공고만 알려줄게.")
                     return finishAuto(show: true)
                 }
                 if d.new_count == 0 {
@@ -617,7 +617,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let e = lastError!
         if e.isTransient && guardian.recordFailure() < 3 { return finishAuto(show: false) }
-        guardian.markDone()
+        if e.isTransient { guardian.markDone() } else { guardian.stopForToday() }  // 로그인 거부 반복 → 계정 잠김 방지
         Notifier.shared.post("HY-WEP 체커 오류", e.message)
         store.error = e.message
         finishAuto(show: true)
