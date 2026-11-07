@@ -56,15 +56,34 @@ NEW   (주)로보티즈          정밀설계팀        D-5 · 11/12(목) 17시�
 - Apple Silicon과 Intel Mac 모두 지원
 - 한양대 포털 아이디와 비밀번호 (HY-WEP 학생 로그인에 쓰는 계정)
 
-### 1. 다운로드
+### 방법 A: Homebrew로 설치 (추천)
+
+[Homebrew](https://brew.sh)를 쓰고 있다면 터미널에 아래 명령을 붙여 넣으면 끝이에요. 보안 경고도 뜨지 않아요.
+
+```bash
+brew tap anrqkdrnl/tap
+brew trust anrqkdrnl/tap        # Homebrew 7 이상에서 필요해요 (예전 버전이면 생략)
+brew install --cask hywep-checker
+```
+
+설치가 끝나면 응용 프로그램 폴더에서 **`HY-WEP 체커`**을 열면 돼요.
+
+- 업데이트: `brew upgrade --cask hywep-checker`
+- 삭제: `brew uninstall --cask hywep-checker` (앱 데이터까지 지우려면 `--zap`을 붙여요)
+
+> `brew trust`는 Homebrew 공식 저장소가 아닌 tap(개인 저장소)을 믿고 쓰겠다고 등록하는 명령이에요. 이 tap에 들어 있는 설치 스크립트는 [anrqkdrnl/homebrew-tap](https://github.com/anrqkdrnl/homebrew-tap)에서 직접 확인할 수 있어요.
+
+### 방법 B: 직접 다운로드
+
+#### 1. 다운로드
 
 [**Releases**](../../releases/latest) 페이지에서 `HywepChecker.zip`을 받아서 압축을 풀어요.
 
-### 2. 응용 프로그램 폴더로 옮기기
+#### 2. 응용 프로그램 폴더로 옮기기
 
 압축을 풀면 나오는 **`HY-WEP 체커.app`**을 **응용 프로그램** 폴더로 드래그해요.
 
-### 3. 처음 열기 (보안 경고 넘기기)
+#### 3. 처음 열기 (보안 경고 넘기기)
 
 Apple 유료 개발자 인증을 받지 않은 앱이라서 처음 열 때 macOS가 막아요. **한 번만** 아래처럼 허용하면 돼요.
 
@@ -166,6 +185,17 @@ HY-WEP 사이트 구조가 바뀌었을 가능성이 커요. 이슈를 남겨 �
 ---
 
 ## 삭제하기
+
+**Homebrew로 설치했다면**
+
+```bash
+brew uninstall --cask hywep-checker          # 앱 + 자동 실행 등록 삭제
+brew uninstall --zap --cask hywep-checker    # 앱 데이터와 설정까지 삭제
+```
+
+키체인에 저장된 계정 정보는 Homebrew가 지우지 않아요. 완전히 지우려면 `security delete-generic-password -s hyu-portal-id; security delete-generic-password -s hyu-portal-pw`를 실행해요.
+
+**직접 다운로드했다면**
 
 1. 설정에서 **매일 아침 자동 확인**을 꺼요.
 2. `HY-WEP 체커.app`을 휴지통으로 옮겨요.
