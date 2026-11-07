@@ -187,6 +187,8 @@ final class DetailController: ObservableObject {
     @Published var status: String?
     @Published var failed = false
     @Published var posting: Posting?
+    /// 지원하기 결과 안내 (상단 표시)
+    @Published var applyNote: String?
     private var window: NSWindow?
     private var loadTask: Task<Void, Never>?
 
@@ -209,6 +211,8 @@ final class DetailController: ObservableObject {
     private func load(forceLogin: Bool) async {
         guard let p = posting else { return }
         failed = false
+        applyNote = nil
+        web.interactive = false
         do {
             if forceLogin || !HyEngine.sessionFresh {
                 status = "HY-WEP 로그인 중…"
@@ -239,6 +243,89 @@ final class DetailController: ObservableObject {
     }
 }
 
+extension DetailController {
+    /// HY-WEP 목록에서 이 공고 줄을 찾아 사이트의 '신청하기'를 대신 눌러준다.
+    /// 실제 신청 여부는 사이트가 띄우는 확인 창에서 사용자가 고른다 (confirm은 대화상자로 표시).
+    /// dryRun이면 찾기만 하고 누르지 않음 (셀프테스트용).
+    @discardableResult
+    func apply(dryRun: Bool = false) async -> String {
+        guard let p = posting else { return "공고 없음" }
+        loadTask?.cancel()
+        failed = false
+        applyNote = nil
+        web.interactive = false
+        do {
+            status = "HY-WEP 목록에서 이 공고 찾는 중…"
+            if !HyEngine.sessionFresh || !web.url.contains("hywep.hanyang.ac.kr") {
+                guard let (u, pw) = await hyCreds.load() else { throw WebError.noCredentials }
+                try await HyEngine.login(web, u, pw)
+            } else if !web.url.contains("list.do") {
+                try await web.go(hyListURL)
+            }
+            if !(try await web.exists(HyEngine.scheduleTabs)) {
+                guard let (u, pw) = await hyCreds.load() else { throw WebError.noCredentials }
+                try await HyEngine.login(web, u, pw)
+            }
+            // 어느 학기 탭·페이지에 있는지 찾기 (목록 조회 POST만)
+            let found = try await web.js(#"""
+                const scheds = [...document.querySelectorAll('li[onclick^="schedule("]')].map(li => li.getAttribute('onclick').match(/\d+/)[0]);
+                for (const s of scheds) {
+                  for (let pg = 0; pg < 60; pg++) {
+                    const body = new URLSearchParams({schedule: s, comp_code: '', pg: String(pg), status: '1137', year: '', term_div: '',
+                      status_comp: '1047', intern_div: '', major_nm: '', comp_name: '', dept: ''});
+                    const r = await fetch('/compjoinsearch/list.do', {method: 'POST', body, credentials: 'include'});
+                    const html = await r.text();
+                    if (html.includes("goView('" + jid + "')")) return body.toString();
+                    const doc = new DOMParser().parseFromString(html, 'text/html');
+                    if ([...doc.querySelectorAll('a[href*="goView"]')].length < 50) break;
+                  }
+                }
+                return '';
+                """#, ["jid": p.jid]) as? String ?? ""
+            if found.isEmpty { throw WebError.other("HY-WEP 목록에서 이 공고를 못 찾았어. 접수가 끝났을 수 있어.") }
+            // 그 목록 페이지를 창에 실제로 띄움
+            var req = URLRequest(url: URL(string: hyListURL)!)
+            req.httpMethod = "POST"
+            req.httpBody = found.data(using: .utf8)
+            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            req.setValue(hyListURL, forHTTPHeaderField: "Referer")
+            try await web.go(req)
+            let info = try await web.js(#"""
+                const a = document.querySelector(`a[href="javascript:goView('${jid}');"]`);
+                const tr = a && a.closest('tr');
+                if (!tr) return 'norow';
+                tr.scrollIntoView({block: 'center'});
+                tr.style.outline = '3px solid #f59e0b'; tr.style.background = '#fff7e6';
+                const btn = [...tr.querySelectorAll('a,button,input[type=button]')]
+                  .find(e => (e.innerText || e.value || '').replace(/\s+/g, '') === '신청하기');
+                if (!btn) {
+                  const last = (tr.lastElementChild ? tr.lastElementChild.innerText : '').replace(/\s+/g, ' ').trim();
+                  return 'nobtn:' + last;
+                }
+                if (!dry) setTimeout(() => btn.click(), 300);
+                return 'ok:' + (btn.getAttribute('onclick') || '').slice(0, 80);
+                """#, ["jid": p.jid, "dry": dryRun]) as? String ?? ""
+            status = nil
+            if info == "norow" { throw WebError.other("목록 페이지에서 이 공고 줄을 못 찾았어.") }
+            if info.hasPrefix("nobtn:") {
+                let last = String(info.dropFirst(6))
+                applyNote = "이 공고에는 '신청하기' 버튼이 없어" + (last.isEmpty ? "." : " (\(last)).") + " 이미 신청했거나 신청할 수 없는 상태일 수 있어. 표시된 줄을 확인해줘."
+                return info
+            }
+            if !dryRun {
+                web.interactive = true  // 사이트의 확인 창을 사용자에게 그대로 보여줌
+                applyNote = "HY-WEP의 '신청하기'를 눌렀어. 뜨는 확인 창에서 [확인]을 눌러야 실제로 신청돼."
+            }
+            return info
+        } catch {
+            if Task.isCancelled { return "취소됨" }
+            failed = true
+            status = error.message
+            return "FAIL " + error.message
+        }
+    }
+}
+
 struct DetailView: View {
     @ObservedObject var ctl: DetailController
 
@@ -254,10 +341,24 @@ struct DetailView: View {
                 if let h = ctl.posting?.home, !h.isEmpty {
                     Button { openURL(h) } label: { Label("기관 홈페이지", systemImage: "building.2") }
                 }
+                Button { Task { await ctl.apply() } } label: { Label("지원하기", systemImage: "paperplane.fill") }
+                    .buttonStyle(.borderedProminent).tint(.teal)
+                    .disabled(ctl.status != nil && !ctl.failed)
+                    .help("HY-WEP 목록에서 이 공고의 '신청하기'를 눌러줘. 사이트 확인 창에서 [확인]을 눌러야 신청돼")
                 Button { ctl.reload(forceLogin: true) } label: { Label("다시 불러오기", systemImage: "arrow.clockwise") }
                     .help("로그인이 풀렸으면 다시 로그인해서 열어")
             }
             .padding(10)
+            if let n = ctl.applyNote {
+                HStack(spacing: 8) {
+                    Image(systemName: "hand.point.right.fill").foregroundStyle(.orange)
+                    Text(n).font(.callout)
+                    Spacer()
+                    Button("공고 내용으로 돌아가기") { ctl.reload(forceLogin: false) }
+                }
+                .padding(.horizontal, 10).padding(.vertical, 8)
+                .background(.orange.opacity(0.12))
+            }
             Divider()
             ZStack {
                 WebViewHost(webView: ctl.web.webView)
@@ -277,7 +378,7 @@ struct DetailView: View {
             }
             HStack {
                 Image(systemName: "info.circle")
-                Text("신청은 HY-WEP 사이트에서 직접 해줘. 이 창은 공고 확인용이야.")
+                Text("‘지원하기’는 사이트의 신청하기 버튼을 대신 눌러줄 뿐이야. 사이트 확인 창에서 [확인]을 눌러야 실제로 신청돼.")
             }
             .font(.caption).foregroundStyle(.secondary).padding(6)
         }
@@ -569,7 +670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             appName: "HY-WEP 체커", icon: "briefcase.fill", tint: .teal,
             features: ["HY-WEP 현장실습 접수중 공고를 한눈에 (검색·정렬·필터)", "새로 올라온 공고에 NEW 표시",
                        "공고를 클릭하면 상세 내용을 앱 안에서 바로 확인", "정한 시각에 자동으로 확인해서 새 공고를 알려줌",
-                       "읽기 전용 — 신청·취소는 절대 건드리지 않음"],
+                       "자동 확인은 읽기 전용 — 신청은 내가 ‘지원하기’를 누를 때만"],
             accountTitle: "HY-WEP 학생 로그인에 쓰는 한양대 포털 계정을 입력해줘.",
             creds: hyCreds, agent: hyAgent,
             autoAction: "새 공고가 있으면 창을 띄워줘",
@@ -645,6 +746,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try await HyEngine.login(web2, u, p)
             print("SECOND LOGIN OK", web2.url)
             web2.close()
+            // 지원하기 흐름을 '찾기'까지만 (누르지 않음)
+            if args.contains("--applydry") {
+                let d = DetailController()
+                for r in rows.sorted(by: { $0.jidNum > $1.jidNum }).prefix(2) {
+                    d.posting = r
+                    let info = await d.apply(dryRun: true)
+                    print("APPLYDRY \(r.jid) \(r.comp): \(info) note=\(d.applyNote ?? "-") url=\(d.web.url)")
+                }
+            }
             if args.contains("--detail"), let r = rows.first {
                 let d = DetailController()
                 d.web.webView.frame = NSRect(x: 0, y: 0, width: 900, height: 800)

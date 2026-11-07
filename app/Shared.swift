@@ -378,6 +378,9 @@ final class WebSession: NSObject, WKNavigationDelegate, WKUIDelegate {
     private var hiddenWindow: NSWindow?
     private(set) var alerts: [String] = []
     private var navError: String?
+    /// true면 페이지의 alert/confirm을 실제 대화상자로 띄워 사용자가 직접 고르게 함 (지원하기 등).
+    /// false(기본)면 자동화용: alert는 기록만, confirm은 항상 '취소'.
+    var interactive = false
 
     static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 
@@ -486,13 +489,32 @@ final class WebSession: NSObject, WKNavigationDelegate, WKUIDelegate {
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
         alerts.append(message)
-        completionHandler()
+        guard interactive else { return completionHandler() }
+        let a = NSAlert()
+        a.messageText = "HY-WEP"
+        a.informativeText = message
+        a.addButton(withTitle: "확인")
+        if let w = webView.window, w.isVisible {
+            a.beginSheetModal(for: w) { _ in completionHandler() }
+        } else {
+            a.runModal(); completionHandler()
+        }
     }
 
     func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
         alerts.append(message)
-        completionHandler(false)
+        guard interactive else { return completionHandler(false) }
+        let a = NSAlert()
+        a.messageText = "HY-WEP"
+        a.informativeText = message
+        a.addButton(withTitle: "확인")
+        a.addButton(withTitle: "취소")
+        if let w = webView.window, w.isVisible {
+            a.beginSheetModal(for: w) { completionHandler($0 == .alertFirstButtonReturn) }
+        } else {
+            completionHandler(a.runModal() == .alertFirstButtonReturn)
+        }
     }
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
