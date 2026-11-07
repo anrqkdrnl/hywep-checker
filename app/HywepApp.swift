@@ -2,6 +2,7 @@
 // 앱 안 브라우저로 로그인해서 조회한다 (읽기 전용: 신청·취소 요청은 보내지 않음).
 import AppKit
 import SwiftUI
+import Combine
 
 let hyHome = "https://hywep.hanyang.ac.kr"
 let hyIndexURL = hyHome + "/index.do"
@@ -271,7 +272,7 @@ extension DetailController {
             } else if !web.url.contains("list.do") {
                 try await web.go(hyListURL)
             }
-            if !(try await web.exists(HyEngine.scheduleTabs)) {
+            if !(await web.exists(HyEngine.scheduleTabs)) {
                 guard let (u, pw) = await hyCreds.load() else { throw WebError.noCredentials }
                 try await HyEngine.login(web, u, pw)
             }
