@@ -59,14 +59,7 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 "$D/run.sh" --force --no-popup || echo "  ⚠️ 첫 실행 실패 — ~/.hywep_check/error.log 확인"
 launchctl bootstrap "gui/$(id -u)" "$P"
 
-echo "▶ 5/5 맥 앱 빌드"
-if [ $NOAPP = 1 ]; then
-  echo "  건너뜀 (--no-app)"
-elif ! xcrun --find swiftc >/dev/null 2>&1; then
-  echo "  ⚠️ Swift 컴파일러가 없어 앱 빌드를 건너뜀 → Xcode 설치 후 ./build_app.sh"
-else
-  ./build_app.sh || echo "  ⚠️ 앱 빌드 실패 — README의 '문제 해결' 참고 (스크립트/자동 실행은 정상 설치됨)"
-fi
+echo "▶ 5/5 (맥 앱은 v2부터 저장소 루트 README 참고 — 이 레거시 버전에는 포함 안 함)"
 
 echo
 echo "✅ 완료. 매일 05시 이후 맥을 처음 깨울 때 1번 확인해서 새 공고가 있으면 팝업."

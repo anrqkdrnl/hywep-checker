@@ -1,8 +1,12 @@
-// 두 앱(LMS 체커 / HY-WEP 체커)이 같이 쓰는 코드: 프로세스 실행, 키체인, launchd, 날짜 포맷.
+// 두 앱(LMS 체커 / HY-WEP 체커)이 같이 쓰는 코드.
+// - 앱 안 브라우저(WKWebView)로 로그인·조회 (Python/터미널 불필요)
+// - 키체인, launchd 자동 실행, 하루 1회 가드, 알림, 창/메뉴, 설정 마법사
 import AppKit
 import SwiftUI
+import UserNotifications
+import WebKit
 
-// MARK: - 프로세스 실행
+// MARK: - 프로세스 실행 (security / launchctl 용)
 
 enum Shell {
     struct Result {
@@ -11,14 +15,12 @@ enum Shell {
         let err: String
     }
 
-    /// 백그라운드 스레드에서 실행하고 끝나면 결과 반환. stdin은 비워둔다.
     static func run(_ exe: String, _ args: [String]) async -> Result {
         await withCheckedContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: exe)
                 p.arguments = args
-                p.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
                 let o = Pipe(), e = Pipe()
                 p.standardOutput = o
                 p.standardError = e
@@ -41,7 +43,8 @@ enum Shell {
     }
 }
 
-// MARK: - 키체인 (기존 스크립트와 같은 방식: /usr/bin/security, account = 로그인 사용자)
+// MARK: - 키체인
+// /usr/bin/security 를 거쳐 저장한다. 앱을 다시 빌드해도(서명이 바뀌어도) 접근 허용 팝업이 뜨지 않게.
 
 enum Keychain {
     static var account: String { NSUserName() }
@@ -55,36 +58,183 @@ enum Keychain {
         await Shell.run("/usr/bin/security", ["find-generic-password", "-a", account, "-s", service]).code == 0
     }
 
+    @discardableResult
     static func write(_ service: String, _ value: String) async -> Bool {
         await Shell.run("/usr/bin/security",
                         ["add-generic-password", "-U", "-a", account, "-s", service, "-w", value]).code == 0
     }
+
+    static func delete(_ service: String) async {
+        _ = await Shell.run("/usr/bin/security", ["delete-generic-password", "-a", account, "-s", service])
+    }
 }
 
-// MARK: - launchd 자동 실행
+/// 앱마다 키체인 서비스 이름 한 쌍
+struct Credentials {
+    let idService: String
+    let pwService: String
+
+    func load() async -> (String, String)? {
+        let u = await Keychain.read(idService), p = await Keychain.read(pwService)
+        return u.isEmpty || p.isEmpty ? nil : (u, p)
+    }
+
+    func isSet() async -> Bool {
+        let a = await Keychain.exists(idService)
+        let b = await Keychain.exists(pwService)
+        return a && b
+    }
+}
+
+// MARK: - launchd 자동 실행 (앱 실행 파일을 --auto 로 10분마다 깨움, 실제 확인은 하루 1번)
 
 struct LaunchAgent {
     let label: String
     var plistPath: String { NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist" }
     private var domain: String { "gui/\(getuid())" }
+    var exists: Bool { FileManager.default.fileExists(atPath: plistPath) }
 
     func isLoaded() async -> Bool {
         await Shell.run("/bin/launchctl", ["print", "\(domain)/\(label)"]).code == 0
     }
 
-    /// 실패하면 오류 메시지 반환
-    func setEnabled(_ on: Bool) async -> String? {
-        let r = on
-            ? await Shell.run("/bin/launchctl", ["bootstrap", domain, plistPath])
-            : await Shell.run("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
+    func programArguments() -> [String] {
+        (NSDictionary(contentsOfFile: plistPath)?["ProgramArguments"] as? [String]) ?? []
+    }
+
+    /// 현재 앱 위치로 plist를 쓰고 등록. 실패하면 오류 메시지.
+    func install() async -> String? {
+        guard let exe = Bundle.main.executablePath else { return "실행 파일 경로를 모름" }
+        let dict: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [exe, "--auto"],
+            "RunAtLoad": false,
+            "StartInterval": 600,
+            "ProcessType": "Interactive",
+        ]
+        do {
+            try FileManager.default.createDirectory(atPath: (plistPath as NSString).deletingLastPathComponent,
+                                                    withIntermediateDirectories: true)
+            let data = try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
+            try data.write(to: URL(fileURLWithPath: plistPath))
+        } catch { return error.localizedDescription }
+        _ = await Shell.run("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
+        let r = await Shell.run("/bin/launchctl", ["bootstrap", domain, plistPath])
         return r.code == 0 ? nil : (r.err.isEmpty ? "launchctl 오류 \(r.code)" : r.err)
     }
 
-    /// plist의 ProgramArguments (실행할 파이썬 경로를 알아내는 데 씀)
-    func programArguments() -> [String] {
-        guard let d = NSDictionary(contentsOfFile: plistPath),
-              let a = d["ProgramArguments"] as? [String] else { return [] }
-        return a
+    func uninstall() async {
+        _ = await Shell.run("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
+        try? FileManager.default.removeItem(atPath: plistPath)
+    }
+
+    /// 앱을 다른 폴더로 옮겼으면 plist 경로 갱신
+    func refreshIfMoved() async {
+        guard exists, let exe = Bundle.main.executablePath, programArguments().first != exe else { return }
+        _ = await install()
+    }
+}
+
+// MARK: - 저장 위치 / 로그
+
+struct AppFiles {
+    let dir: URL
+
+    init(_ name: String) {
+        dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(name, isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+
+    func url(_ file: String) -> URL { dir.appendingPathComponent(file) }
+
+    func log(_ msg: String) {
+        let line = "[\(DateUtil.stamp(Date()))] \(msg)\n"
+        let u = url("error.log")
+        if let h = try? FileHandle(forWritingTo: u) {
+            h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
+        } else {
+            try? Data(line.utf8).write(to: u)
+        }
+    }
+
+    func save<T: Encodable>(_ value: T, _ file: String) throws {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try enc.encode(value).write(to: url(file), options: .atomic)
+    }
+
+    func load<T: Decodable>(_ type: T.Type, _ file: String) -> T? {
+        guard let d = try? Data(contentsOf: url(file)) else { return nil }
+        return try? JSONDecoder().decode(type, from: d)
+    }
+
+    func mtime(_ file: String) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url(file).path))?[.modificationDate] as? Date
+    }
+
+    /// 자동 실행 중복 방지 잠금. 이미 다른 프로세스가 잡고 있으면 false.
+    func lock() -> Bool {
+        let u = url("auto.lock")
+        if let s = try? String(contentsOf: u, encoding: .utf8), let pid = Int32(s), pid != getpid(), kill(pid, 0) == 0 {
+            return false
+        }
+        try? "\(getpid())".write(to: u, atomically: true, encoding: .utf8)
+        return true
+    }
+
+    func unlock() { try? FileManager.default.removeItem(at: url("auto.lock")) }
+}
+
+// MARK: - 하루 1번 가드 + 실패 횟수 (UserDefaults)
+
+struct DailyGuard {
+    private let d = UserDefaults.standard
+
+    var lastRun: String? { d.string(forKey: "lastRun") }
+
+    func shouldRun() -> Bool {
+        DateUtil.calendar.component(.hour, from: Date()) >= 5 && lastRun != DateUtil.today()
+    }
+
+    func markDone() {
+        d.set(DateUtil.today(), forKey: "lastRun")
+        d.removeObject(forKey: "failDate")
+        d.removeObject(forKey: "failCount")
+    }
+
+    /// 오늘 실패 횟수 (+1 한 값)
+    func recordFailure() -> Int {
+        let t = DateUtil.today()
+        let n = (d.string(forKey: "failDate") == t ? d.integer(forKey: "failCount") : 0) + 1
+        d.set(t, forKey: "failDate")
+        d.set(n, forKey: "failCount")
+        return n
+    }
+}
+
+// MARK: - 알림
+
+final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = Notifier()
+
+    func setUp() { UNUserNotificationCenter.current().delegate = self }
+
+    func requestPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    func post(_ title: String, _ body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        c.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
     }
 }
 
@@ -92,6 +242,12 @@ struct LaunchAgent {
 
 enum DateUtil {
     static let kst = TimeZone(identifier: "Asia/Seoul")!
+
+    static var calendar: Calendar {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = kst
+        return c
+    }
 
     static func parse(_ s: String?) -> Date? {
         guard var s, !s.isEmpty else { return nil }
@@ -104,13 +260,26 @@ enum DateUtil {
         return f.date(from: String(s.prefix(10)))
     }
 
-    static var calendar: Calendar {
-        var c = Calendar(identifier: .gregorian)
-        c.timeZone = kst
-        return c
+    static func iso(_ d: Date?) -> String? {
+        guard let d else { return nil }
+        let f = ISO8601DateFormatter()
+        f.timeZone = kst
+        return f.string(from: d)
     }
 
-    /// 오늘 기준 며칠 뒤인지 (날짜 단위)
+    private static func fmt(_ pattern: String, _ d: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ko_KR")
+        f.timeZone = kst
+        f.dateFormat = pattern
+        return f.string(from: d)
+    }
+
+    static func today() -> String { fmt("yyyy-MM-dd", Date()) }
+    static func ymd(_ d: Date) -> String { fmt("yyyy-MM-dd", d) }
+    static func stamp(_ d: Date) -> String { fmt("yyyy-MM-dd HH:mm:ss", d) }
+    static func label(_ d: Date, time: Bool = true) -> String { fmt(time ? "M/d(E) HH:mm" : "M/d(E)", d) }
+
     static func dayDiff(_ d: Date) -> Int {
         let c = calendar
         return c.dateComponents([.day], from: c.startOfDay(for: Date()), to: c.startOfDay(for: d)).day ?? 0
@@ -120,25 +289,251 @@ enum DateUtil {
         n == 0 ? "오늘" : n == 1 ? "내일" : n > 0 ? "D-\(n)" : "\(-n)일 지남"
     }
 
-    static func label(_ d: Date, time: Bool = true) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "ko_KR")
-        f.timeZone = kst
-        f.dateFormat = time ? "M/d(E) HH:mm" : "M/d(E)"
-        return f.string(from: d)
-    }
-
     static func relative(_ d: Date) -> String {
         let f = RelativeDateTimeFormatter()
         f.locale = Locale(identifier: "ko_KR")
         f.unitsStyle = .full
-        return f.localizedString(for: d, relativeTo: Date())
+        return f.localizedString(for: min(d, Date()), relativeTo: Date())
+    }
+}
+
+// MARK: - 앱 안 브라우저
+
+enum WebError: LocalizedError {
+    case noCredentials
+    case loginRejected(String)
+    case timeout(String)
+    case network(String)
+    case other(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noCredentials: return "아이디/비밀번호가 저장돼 있지 않아. 설정에서 입력해줘."
+        case .loginRejected(let m): return "로그인이 거부됐어: \(m)\n(아이디/비밀번호를 확인하거나, 포털 비밀번호를 바꿨으면 설정에서 다시 저장해줘)"
+        case .timeout(let w): return "\(w) 응답이 없어 (네트워크 확인) — 잠시 후 다시 시도해줘"
+        case .network(let m): return "인터넷 연결 오류: \(m)"
+        case .other(let m): return m
+        }
+    }
+
+    /// 다시 시도하면 될 수도 있는 오류인지 (로그인 거부는 재시도하면 계정이 잠길 수 있어 false)
+    var isTransient: Bool {
+        switch self {
+        case .timeout, .network: return true
+        default: return false
+        }
+    }
+}
+
+extension Error {
+    var isTransient: Bool { (self as? WebError)?.isTransient ?? true }
+    var message: String { (self as? LocalizedError)?.errorDescription ?? localizedDescription }
+}
+
+/// WKWebView 한 개를 감싼 자동화 도우미. 보이지 않는 창(화면 밖)에 붙여서 쓰거나, 보이는 창에 붙여서 쓴다.
+@MainActor
+final class WebSession: NSObject, WKNavigationDelegate, WKUIDelegate {
+    let webView: WKWebView
+    private var hiddenWindow: NSWindow?
+    private(set) var alerts: [String] = []
+    private var navError: String?
+
+    static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+
+    init(hidden: Bool = true) {
+        let cfg = WKWebViewConfiguration()
+        cfg.websiteDataStore = .default()
+        webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 1280, height: 900), configuration: cfg)
+        webView.customUserAgent = WebSession.userAgent
+        super.init()
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        if hidden {
+            // 화면 밖에 놓인 창: 페이지 스크립트가 정상 속도로 돌도록 창에는 붙여둔다
+            let w = NSWindow(contentRect: NSRect(x: -30000, y: -30000, width: 1280, height: 900),
+                             styleMask: [.borderless], backing: .buffered, defer: false)
+            w.isReleasedWhenClosed = false
+            w.contentView = webView
+            w.orderFrontRegardless()
+            hiddenWindow = w
+        }
+    }
+
+    func close() {
+        webView.stopLoading()
+        hiddenWindow?.orderOut(nil)
+        hiddenWindow = nil
+    }
+
+    var url: String { webView.url?.absoluteString ?? "" }
+
+    func clearAlerts() { alerts.removeAll() }
+
+    func go(_ url: String, timeout: Double = 45) async throws {
+        try await go(URLRequest(url: URL(string: url)!), timeout: timeout)
+    }
+
+    func go(_ req: URLRequest, timeout: Double = 45) async throws {
+        navError = nil
+        webView.load(req)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        try await until(timeout, "페이지(\(req.url?.host ?? ""))") { !self.webView.isLoading || self.navError != nil }
+        if let e = navError { throw WebError.network(e) }
+    }
+
+    /// 조건이 참이 될 때까지 대기. 로그인 거부 alert가 뜨면 바로 실패.
+    func until(_ timeout: Double, _ what: String, failOnAlert: Bool = false,
+               _ cond: @escaping () async -> Bool) async throws {
+        let end = Date().addingTimeInterval(timeout)
+        while Date() < end {
+            if failOnAlert, let a = alerts.last { throw WebError.loginRejected(a) }
+            if await cond() { return }
+            try await Task.sleep(nanoseconds: 400_000_000)
+        }
+        if failOnAlert, let a = alerts.last { throw WebError.loginRejected(a) }
+        throw WebError.timeout(what)
+    }
+
+    /// 페이지 컨텍스트에서 async 함수 본문 실행. 반드시 값을 return 할 것.
+    func js(_ body: String, _ args: [String: Any] = [:]) async throws -> Any? {
+        try await webView.callAsyncJavaScript(body, arguments: args, in: nil, contentWorld: .page)
+    }
+
+    /// 목록 중 처음으로 존재하는 선택자 (없으면 nil)
+    func first(_ selectors: [String]) async -> String? {
+        let r = try? await js("for (const s of sels) { if (document.querySelector(s)) return s; } return '';", ["sels": selectors])
+        guard let s = r as? String, !s.isEmpty else { return nil }
+        return s
+    }
+
+    func exists(_ selector: String) async -> Bool { await first([selector]) != nil }
+
+    /// 한양 통합 로그인 폼(#uid/#upw/#login_btn) 입력 후 제출
+    func submitHanyangLogin(_ uid: String, _ pw: String) async throws {
+        clearAlerts()
+        _ = try await js("""
+            const set = (sel, v) => { const e = document.querySelector(sel); e.focus(); e.value = v;
+              e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true})); };
+            set('#uid', uid); set('#upw', upw);
+            setTimeout(() => document.querySelector('#login_btn').click(), 50);
+            return true;
+            """, ["uid": uid, "upw": pw])
+    }
+
+    func cookie(_ name: String) async -> String? {
+        let all = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
+        return all.first { $0.name == name && !$0.value.isEmpty }?.value
+    }
+
+    // WKNavigationDelegate
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        noteFailure(error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        noteFailure(error)
+    }
+
+    private func noteFailure(_ error: Error) {
+        let e = error as NSError
+        if e.domain == NSURLErrorDomain && e.code == NSURLErrorCancelled { return }
+        if e.domain == "WebKitErrorDomain" && e.code == 102 { return }  // 프레임 로드 중단(리다이렉트 등)
+        navError = e.localizedDescription
+    }
+
+    // WKUIDelegate — alert/confirm은 기록만 하고 닫기, 새 창은 같은 뷰에서 열기
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+        alerts.append(message)
+        completionHandler()
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+        alerts.append(message)
+        completionHandler(false)
+    }
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
+        return nil
+    }
+}
+
+/// SwiftUI에 WKWebView 붙이기
+struct WebViewHost: NSViewRepresentable {
+    let webView: WKWebView
+    func makeNSView(context: Context) -> WKWebView { webView }
+    func updateNSView(_ nsView: WKWebView, context: Context) {}
+}
+
+// MARK: - 창 / 메뉴
+
+@MainActor
+enum Windows {
+    static func make<V: View>(_ title: String, size: NSSize, resizable: Bool = true, autosave: String? = nil,
+                              _ view: V) -> NSWindow {
+        var style: NSWindow.StyleMask = [.titled, .closable, .miniaturizable]
+        if resizable { style.insert(.resizable) }
+        let w = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: style, backing: .buffered, defer: false)
+        w.title = title
+        w.isReleasedWhenClosed = false
+        w.contentView = NSHostingView(rootView: view)
+        w.center()
+        if let autosave { w.setFrameAutosaveName(autosave) }
+        return w
+    }
+
+    static func present(_ w: NSWindow) {
+        NSApp.setActivationPolicy(.regular)
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// 앱 메뉴 / 편집 메뉴(⌘C·⌘V가 텍스트 칸에서 동작하려면 필요) / 윈도우 메뉴
+    static func installMenu(appName: String, target: AnyObject, settings: Selector, refresh: Selector) {
+        let main = NSMenu()
+        let appItem = NSMenuItem(); main.addItem(appItem)
+        let app = NSMenu()
+        app.addItem(withTitle: "\(appName) 정보", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        app.addItem(.separator())
+        let s = app.addItem(withTitle: "설정…", action: settings, keyEquivalent: ",")
+        s.target = target
+        app.addItem(.separator())
+        app.addItem(withTitle: "\(appName) 가리기", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        app.addItem(withTitle: "\(appName) 종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = app
+
+        let fileItem = NSMenuItem(); main.addItem(fileItem)
+        let file = NSMenu(title: "파일")
+        let r = file.addItem(withTitle: "지금 확인", action: refresh, keyEquivalent: "r")
+        r.target = target
+        file.addItem(withTitle: "창 닫기", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        fileItem.submenu = file
+
+        let editItem = NSMenuItem(); main.addItem(editItem)
+        let edit = NSMenu(title: "편집")
+        edit.addItem(withTitle: "실행 취소", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "실행 복귀", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "잘라내기", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "복사하기", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "붙여넣기", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "전체 선택", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+
+        let winItem = NSMenuItem(); main.addItem(winItem)
+        let win = NSMenu(title: "윈도우")
+        win.addItem(withTitle: "최소화", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        winItem.submenu = win
+        NSApp.windowsMenu = win
+        NSApp.mainMenu = main
     }
 }
 
 // MARK: - 공용 뷰
 
-/// 실행 중일 때 경과 시간 표시
 struct RunningIndicator: View {
     let since: Date
     let message: String
@@ -149,12 +544,12 @@ struct RunningIndicator: View {
                 Text("\(message) \(Int(ctx.date.timeIntervalSince(since)))초")
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
         }
     }
 }
 
-/// 실행 실패 배너
 struct ErrorBanner: View {
     let message: String
     let onClose: () -> Void
@@ -171,11 +566,10 @@ struct ErrorBanner: View {
     }
 }
 
-/// 아이디/비밀번호 입력 → 키체인 저장. 비밀번호는 화면에 다시 불러오지 않는다.
+/// 설정 화면의 계정 칸
 struct CredentialSection: View {
     let title: String
-    let idService: String
-    let pwService: String
+    let creds: Credentials
     @State private var uid = ""
     @State private var pw = ""
     @State private var hasPw = false
@@ -186,25 +580,26 @@ struct CredentialSection: View {
             TextField("아이디", text: $uid)
             SecureField("비밀번호", text: $pw, prompt: Text(hasPw ? "저장됨 — 바꿀 때만 입력" : "비밀번호"))
             HStack {
-                Button("키체인에 저장") { Task { await save() } }
+                Button("저장") { Task { await save() } }
                     .disabled(uid.isEmpty || (!hasPw && pw.isEmpty))
                 Text(msg).font(.callout).foregroundStyle(.secondary)
             }
         } header: {
             Text(title)
         } footer: {
-            Text("macOS 키체인(\(idService) / \(pwService))에만 저장돼.").font(.caption).foregroundStyle(.secondary)
+            Text("이 Mac의 키체인에만 저장돼. 다른 곳으로 전송되지 않아 (학교 로그인 페이지 제외).")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .task {
-            uid = await Keychain.read(idService)
-            hasPw = await Keychain.exists(pwService)
+            uid = await Keychain.read(creds.idService)
+            hasPw = await Keychain.exists(creds.pwService)
         }
     }
 
     private func save() async {
-        var ok = await Keychain.write(idService, uid)
+        var ok = await Keychain.write(creds.idService, uid)
         if !pw.isEmpty {
-            let ok2 = await Keychain.write(pwService, pw)
+            let ok2 = await Keychain.write(creds.pwService, pw)
             ok = ok && ok2
             if ok2 { hasPw = true }
             pw = ""
@@ -213,7 +608,6 @@ struct CredentialSection: View {
     }
 }
 
-/// launchd 자동 실행 켜기/끄기
 struct AutoRunSection: View {
     let agent: LaunchAgent
     let description: String
@@ -226,15 +620,15 @@ struct AutoRunSection: View {
             Toggle(isOn: Binding(get: { on }, set: { v in
                 Task {
                     busy = true
-                    err = await agent.setEnabled(v) ?? ""
+                    if v { err = await agent.install() ?? "" } else { await agent.uninstall(); err = "" }
                     on = await agent.isLoaded()
                     busy = false
                 }
             })) {
-                Text("자동 확인")
+                Text("매일 아침 자동 확인")
                 Text(description).font(.caption).foregroundStyle(.secondary)
             }
-            .disabled(busy || !FileManager.default.fileExists(atPath: agent.plistPath))
+            .disabled(busy)
             if !err.isEmpty { Text(err).font(.caption).foregroundStyle(.red) }
         } header: {
             Text("자동 실행")
@@ -243,26 +637,182 @@ struct AutoRunSection: View {
     }
 }
 
-/// 마지막 창을 닫으면 앱 종료
-final class QuitOnCloseDelegate: NSObject, NSApplicationDelegate {
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-}
+/// 예전(터미널/Python) 버전 자동 실행이 남아 있으면 끄기 버튼
+struct LegacySection: View {
+    let label: String
+    let folder: String
+    @State private var present = false
 
-func openURL(_ s: String) {
-    if let u = URL(string: s), !s.isEmpty { NSWorkspace.shared.open(u) }
-}
-
-func openFile(_ path: String, textEdit: Bool = false) {
-    let url = URL(fileURLWithPath: path)
-    if textEdit {
-        NSWorkspace.shared.open([url], withApplicationAt: URL(fileURLWithPath: "/System/Applications/TextEdit.app"),
-                                configuration: NSWorkspace.OpenConfiguration())
-    } else {
-        NSWorkspace.shared.open(url)
+    var body: some View {
+        Group {
+            if present {
+                Section {
+                    Text("예전 터미널(Python) 버전의 자동 실행이 아직 켜져 있어. 이 앱과 같이 켜두면 아침 팝업이 두 번 떠.")
+                        .font(.callout)
+                    Button("예전 버전 자동 실행 끄기") {
+                        Task {
+                            _ = await Shell.run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+                            let p = NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist"
+                            try? FileManager.default.moveItem(atPath: p, toPath: NSHomeDirectory() + "/\(folder)/\(label).plist.disabled")
+                            present = false
+                        }
+                    }
+                } header: { Text("예전 버전") }
+            }
+        }
+        .onAppear { present = FileManager.default.fileExists(atPath: NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist") }
     }
 }
 
-/// stderr 마지막 몇 줄만 (트레이스백 전체는 너무 김)
-func tail(_ s: String, lines n: Int = 4) -> String {
-    s.split(separator: "\n").suffix(n).joined(separator: "\n")
+// MARK: - 처음 실행 설정 마법사
+
+struct SetupView: View {
+    let appName: String
+    let icon: String
+    let tint: Color
+    let features: [String]
+    let accountTitle: String
+    let creds: Credentials
+    let agent: LaunchAgent
+    let autoDescription: String
+    /// 아이디/비번으로 실제 로그인 시험
+    let testLogin: (String, String) async throws -> Void
+    let onFinish: () -> Void
+
+    @State private var step = 0
+    @State private var uid = ""
+    @State private var pw = ""
+    @State private var testing = false
+    @State private var error = ""
+    @State private var auto = true
+    @State private var notify = true
+    @State private var finishing = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Group {
+                switch step {
+                case 0: welcome
+                case 1: account
+                default: options
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(28)
+        }
+        .frame(width: 520, height: 480)
+        .task { uid = await Keychain.read(creds.idService) }
+    }
+
+    var welcome: some View {
+        VStack(spacing: 18) {
+            Image(systemName: icon).font(.system(size: 54)).foregroundStyle(tint)
+            Text("\(appName)에 오신 걸 환영해요").font(.title.bold())
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(features, id: \.self) { f in
+                    Label { Text(f) } icon: { Image(systemName: "checkmark.circle.fill").foregroundStyle(tint) }
+                }
+            }
+            .frame(maxWidth: 400, alignment: .leading)
+            Spacer()
+            Button { step = 1 } label: { Text("시작하기").frame(width: 160) }
+                .controlSize(.large).buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+        }
+    }
+
+    var account: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("1. 한양대 계정 연결").font(.title2.bold())
+            Text(accountTitle).foregroundStyle(.secondary)
+            Form {
+                TextField("포털 아이디", text: $uid)
+                SecureField("비밀번호", text: $pw)
+            }
+            .formStyle(.grouped)
+            .frame(height: 130)
+            Label("아이디·비밀번호는 이 Mac의 키체인에만 저장되고, 학교 로그인 페이지 외에는 어디로도 보내지 않아요.",
+                  systemImage: "lock.shield").font(.caption).foregroundStyle(.secondary)
+            if !error.isEmpty {
+                Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+            }
+            Spacer()
+            HStack {
+                Button("이전") { step = 0 }
+                Spacer()
+                if testing { ProgressView().controlSize(.small); Text("로그인 확인 중…").foregroundStyle(.secondary) }
+                Button { Task { await test() } } label: { Text("로그인 확인").frame(width: 120) }
+                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    .disabled(uid.isEmpty || pw.isEmpty || testing)
+            }
+        }
+    }
+
+    var options: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("2. 자동 확인").font(.title2.bold())
+            Label("로그인 성공!", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
+            Form {
+                Toggle(isOn: $auto) {
+                    Text("매일 아침 자동 확인")
+                    Text(autoDescription).font(.caption).foregroundStyle(.secondary)
+                }
+                Toggle(isOn: $notify) {
+                    Text("알림 받기")
+                    Text("결과를 알림 센터로도 알려줘요. 다음 화면에서 macOS가 허용 여부를 물어봐요.").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+            .frame(height: 150)
+            Text("나중에 설정(⌘,)에서 언제든 바꿀 수 있어요.").font(.caption).foregroundStyle(.secondary)
+            Spacer()
+            HStack {
+                Button("이전") { step = 1 }
+                Spacer()
+                Button {
+                    finishing = true
+                    Task {
+                        if auto { _ = await agent.install() } else { await agent.uninstall() }
+                        if notify { Notifier.shared.requestPermission() }
+                        UserDefaults.standard.set(true, forKey: "setupDone")
+                        onFinish()
+                    }
+                } label: { Text("완료하고 지금 확인").frame(width: 160) }
+                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(finishing)
+            }
+        }
+    }
+
+    private func test() async {
+        testing = true
+        error = ""
+        defer { testing = false }
+        do {
+            try await testLogin(uid, pw)
+            await Keychain.write(creds.idService, uid)
+            await Keychain.write(creds.pwService, pw)
+            pw = ""
+            step = 2
+        } catch {
+            self.error = error.message
+        }
+    }
+}
+
+// MARK: - 기타
+
+func openURL(_ s: String?) {
+    guard let s, !s.isEmpty, let u = URL(string: s) else { return }
+    NSWorkspace.shared.open(u)
+}
+
+func copyToPasteboard(_ s: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(s, forType: .string)
+}
+
+/// 같은 앱이 이미 떠 있는지 (launchd가 띄운 --auto 인스턴스 포함)
+func otherInstanceRunning() -> Bool {
+    guard let id = Bundle.main.bundleIdentifier else { return false }
+    return NSRunningApplication.runningApplications(withBundleIdentifier: id)
+        .contains { $0.processIdentifier != getpid() }
 }
