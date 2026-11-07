@@ -395,6 +395,112 @@ struct DetailView: View {
     }
 }
 
+// MARK: - 이력서 수정 창 (MY PAGE → 이력서 작성 버튼 경유. 직접 주소로 들어가면 사이트가 막음)
+
+@MainActor
+final class ResumeController: ObservableObject {
+    let web = WebSession(hidden: false)
+    @Published var status: String?
+    @Published var failed = false
+    @Published var note: String?
+    private var window: NSWindow?
+    private var loadTask: Task<Void, Never>?
+
+    func open() {
+        if window == nil {
+            window = Windows.make("이력서 수정", size: NSSize(width: 1100, height: 880), autosave: "resume", ResumeView(ctl: self))
+        }
+        Windows.present(window!)
+        if loadTask == nil || failed || web.url.isEmpty { reload(forceLogin: false) }
+    }
+
+    func reload(forceLogin: Bool) {
+        loadTask?.cancel()
+        loadTask = Task { await load(forceLogin: forceLogin) }
+    }
+
+    private func load(forceLogin: Bool) async {
+        failed = false
+        note = nil
+        web.interactive = false
+        do {
+            if forceLogin || !HyEngine.sessionFresh {
+                status = "HY-WEP 로그인 중…"
+                guard let (u, pw) = await hyCreds.load() else { throw WebError.noCredentials }
+                try await HyEngine.login(web, u, pw)
+                if Task.isCancelled { return }
+            }
+            status = "MY PAGE 여는 중…"
+            web.clearAlerts()
+            try await web.go(hyHome + "/studentMain/dashBoard.do")
+            if !web.url.contains("dashBoard") || !web.alerts.isEmpty {
+                if !forceLogin { return await load(forceLogin: true) }
+                throw WebError.other("MY PAGE를 못 열었어 \(web.alerts.last ?? "")")
+            }
+            status = "이력서 작성 화면 여는 중…"
+            let clicked = try await web.js("""
+                const a = document.querySelector('a[href*="/studentcareer/regedit.do"]');
+                if (!a) return false;
+                a.click();
+                return true;
+                """) as? Bool ?? false
+            if clicked {
+                try? await web.until(20, "이력서 화면") { self.web.url.contains("regedit.do") && !self.web.webView.isLoading }
+            } else {
+                note = "MY PAGE에서 이력서 작성 버튼을 못 찾았어. 아래 화면의 '이력서 작성' 항목에서 직접 눌러줘."
+            }
+            web.interactive = true  // 저장 확인 창·사진 첨부 등을 사용자에게 그대로 보여줌
+            status = nil
+        } catch {
+            if Task.isCancelled { return }
+            failed = true
+            status = error.message
+        }
+    }
+}
+
+struct ResumeView: View {
+    @ObservedObject var ctl: ResumeController
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("이력서 · 자기소개서 수정").font(.headline)
+                    Text("HY-WEP MY PAGE의 이력서 작성 화면이야. 다 쓰면 페이지 안의 저장 버튼을 눌러줘.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button { ctl.reload(forceLogin: false) } label: { Label("처음 화면으로", systemImage: "arrow.uturn.backward") }
+                    .help("MY PAGE를 거쳐 이력서 작성 화면을 다시 열어 (저장 안 한 내용은 사라져)")
+            }
+            .padding(10)
+            if let n = ctl.note {
+                HStack { Image(systemName: "hand.point.right.fill").foregroundStyle(.orange); Text(n).font(.callout); Spacer() }
+                    .padding(.horizontal, 10).padding(.vertical, 8).background(.orange.opacity(0.12))
+            }
+            Divider()
+            ZStack {
+                WebViewHost(webView: ctl.web.webView)
+                if let s = ctl.status {
+                    VStack(spacing: 10) {
+                        if ctl.failed {
+                            Image(systemName: "exclamationmark.triangle").font(.largeTitle).foregroundStyle(.orange)
+                        } else {
+                            ProgressView()
+                        }
+                        Text(s).multilineTextAlignment(.center).frame(maxWidth: 420)
+                        if ctl.failed { Button("다시 시도") { ctl.reload(forceLogin: true) } }
+                    }
+                    .padding(24)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
+        }
+        .frame(minWidth: 760, minHeight: 520)
+    }
+}
+
 // MARK: - 화면 상태
 
 @MainActor
@@ -405,6 +511,7 @@ final class HyStore: ObservableObject {
     @Published var error: String?
     var openSettings: () -> Void = {}
     let detail = DetailController()
+    let resume = ResumeController()
     private var loadedAt: Date?
 
     func load() {
@@ -490,6 +597,8 @@ struct HyContentView: View {
                 if let s = store.running { RunningIndicator(since: s, message: "") }
                 Button { store.check() } label: { Label("지금 확인", systemImage: "arrow.clockwise") }
                     .disabled(store.running != nil)
+                Button { store.resume.open() } label: { Label("이력서 수정", systemImage: "doc.text") }
+                    .help("HY-WEP 이력서·자기소개서 작성 화면을 앱 안에서 열어")
                 Button { openURL(hyListURL) } label: { Label("HY-WEP 사이트", systemImage: "safari") }
                 Button { store.openSettings() } label: { Image(systemName: "gearshape") }.help("설정 (⌘,)")
             }
@@ -755,6 +864,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try await HyEngine.login(web2, u, p)
             print("SECOND LOGIN OK", web2.url)
             web2.close()
+            // 이력서 수정 창: MY PAGE 경유로 이력서 화면까지 열리는지 (보기만, 저장 안 함)
+            if args.contains("--resume") {
+                let c = ResumeController()
+                c.web.webView.frame = NSRect(x: 0, y: 0, width: 1100, height: 800)
+                c.reload(forceLogin: false)
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+                for _ in 0..<80 where c.status != nil { try await Task.sleep(nanoseconds: 500_000_000) }
+                let text = (try? await c.web.js("return document.body.innerText.replace(/\\s+/g,' ').slice(0, 300);")) as? String ?? ""
+                print("RESUME url=\(c.web.url) status=\(c.status ?? "ok") note=\(c.note ?? "-") alerts=\(c.web.alerts)\n\(text)")
+            }
             // 지원하기 흐름을 '찾기'까지만 (누르지 않음)
             if args.contains("--applydry") {
                 let d = DetailController()

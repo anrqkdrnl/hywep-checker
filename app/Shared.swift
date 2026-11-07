@@ -538,6 +538,21 @@ final class WebSession: NSObject, WKNavigationDelegate, WKUIDelegate {
         }
     }
 
+    /// <input type="file"> (이력서 사진·첨부 등): 사용자가 고르는 경우에만
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
+        guard interactive else { return completionHandler(nil) }
+        let p = NSOpenPanel()
+        p.allowsMultipleSelection = parameters.allowsMultipleSelection
+        p.canChooseDirectories = parameters.allowsDirectories
+        p.canChooseFiles = true
+        if let w = webView.window, w.isVisible {
+            p.beginSheetModal(for: w) { completionHandler($0 == .OK ? p.urls : nil) }
+        } else {
+            completionHandler(p.runModal() == .OK ? p.urls : nil)
+        }
+    }
+
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
