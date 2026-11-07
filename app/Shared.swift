@@ -86,7 +86,7 @@ struct Credentials {
     }
 }
 
-// MARK: - launchd 자동 실행 (앱 실행 파일을 --auto 로 10분마다 깨움, 실제 확인은 하루 1번)
+// MARK: - launchd 자동 실행 (앱 실행 파일을 --auto 로 10분마다 깨움, 실제 확인은 설정한 시각마다 1번)
 
 struct LaunchAgent {
     let label: String
@@ -102,12 +102,24 @@ struct LaunchAgent {
         (NSDictionary(contentsOfFile: plistPath)?["ProgramArguments"] as? [String]) ?? []
     }
 
+    /// 앱이 지워졌으면(업데이트 중 잠깐 빈 경우를 피하려고 90초 기다려 다시 확인) 스스로 등록을 지움
+    static let runner = """
+        if [ ! -x "$0" ]; then sleep 90; fi
+        if [ -x "$0" ]; then exec "$0" --auto; fi
+        rm -f "$1"
+        /bin/launchctl bootout "gui/$(id -u)/$2"
+        """
+
+    func desiredArguments(_ exe: String) -> [String] {
+        ["/bin/sh", "-c", LaunchAgent.runner, exe, plistPath, label]
+    }
+
     /// 현재 앱 위치로 plist를 쓰고 등록. 실패하면 오류 메시지.
     func install() async -> String? {
         guard let exe = Bundle.main.executablePath else { return "실행 파일 경로를 모름" }
         let dict: [String: Any] = [
             "Label": label,
-            "ProgramArguments": [exe, "--auto"],
+            "ProgramArguments": desiredArguments(exe),
             "RunAtLoad": false,
             "StartInterval": 600,
             "ProcessType": "Interactive",
@@ -118,20 +130,28 @@ struct LaunchAgent {
             let data = try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
             try data.write(to: URL(fileURLWithPath: plistPath))
         } catch { return error.localizedDescription }
+        UserDefaults.standard.set(true, forKey: "autoEnabled")
         _ = await Shell.run("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
         let r = await Shell.run("/bin/launchctl", ["bootstrap", domain, plistPath])
         return r.code == 0 ? nil : (r.err.isEmpty ? "launchctl 오류 \(r.code)" : r.err)
     }
 
     func uninstall() async {
+        UserDefaults.standard.set(false, forKey: "autoEnabled")
         _ = await Shell.run("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
         try? FileManager.default.removeItem(atPath: plistPath)
     }
 
-    /// 앱을 다른 폴더로 옮겼으면 plist 경로 갱신
+    /// 앱을 다른 폴더로 옮겼거나 예전 형식이면 plist 갱신.
+    /// 자동 확인을 켜뒀는데 등록이 사라졌으면(앱 삭제 후 재설치, brew 업데이트 등) 다시 등록.
     func refreshIfMoved() async {
-        guard exists, let exe = Bundle.main.executablePath, programArguments().first != exe else { return }
-        _ = await install()
+        guard let exe = Bundle.main.executablePath else { return }
+        if exists {
+            UserDefaults.standard.set(true, forKey: "autoEnabled")
+            if programArguments() != desiredArguments(exe) { _ = await install() }
+        } else if UserDefaults.standard.bool(forKey: "autoEnabled") {
+            _ = await install()
+        }
     }
 }
 
