@@ -793,30 +793,42 @@ struct AutoRunSection: View {
     }
 }
 
-/// 예전(터미널/Python) 버전 자동 실행이 남아 있으면 끄기 버튼
-struct LegacySection: View {
-    let label: String
-    let folder: String
-    @State private var present = false
+/// 앱 번들 ID가 바뀐 경우: 예전 ID로 저장된 설정·자동 실행 등록을 지금 ID로 옮김.
+/// 예전 ID는 이름 끝부분(예: "lmschecker")으로 찾는다.
+enum Migration {
+    private static func oldIDs(_ suffix: String) -> [String] {
+        let dir = NSHomeDirectory() + "/Library/Preferences"
+        let me = Bundle.main.bundleIdentifier ?? ""
+        return ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
+            .filter { $0.hasSuffix(".\(suffix).plist") }
+            .map { String($0.dropLast(6)) }
+            .filter { $0 != me && $0.split(separator: ".").count >= 3 }
+    }
 
-    var body: some View {
-        Group {
-            if present {
-                Section {
-                    Text("예전 터미널(Python) 버전의 자동 실행이 아직 켜져 있어. 이 앱과 같이 켜두면 팝업이 두 번 떠.")
-                        .font(.callout)
-                    Button("예전 버전 자동 실행 끄기") {
-                        Task {
-                            _ = await Shell.run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
-                            let p = NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist"
-                            try? FileManager.default.moveItem(atPath: p, toPath: NSHomeDirectory() + "/\(folder)/\(label).plist.disabled")
-                            present = false
-                        }
-                    }
-                } header: { Text("예전 버전") }
+    /// 설정(UserDefaults) 옮기기. 모든 실행 방식에서 맨 먼저 호출.
+    static func defaults(_ suffix: String) {
+        let d = UserDefaults.standard
+        guard !d.bool(forKey: "migratedOldID") else { return }
+        for old in oldIDs(suffix) {
+            if let dom = d.persistentDomain(forName: old) {
+                for (k, v) in dom where d.object(forKey: k) == nil { d.set(v, forKey: k) }
             }
+            d.removePersistentDomain(forName: old)
         }
-        .onAppear { present = FileManager.default.fileExists(atPath: NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist") }
+        d.set(true, forKey: "migratedOldID")
+    }
+
+    /// 예전 이름의 자동 실행 등록을 내리고 지움 (지금 이름으로는 refreshIfMoved가 다시 등록).
+    /// 자동 실행(--auto) 중에는 자기 자신이 종료되므로 호출하지 말 것.
+    static func agents(_ suffix: String, current: LaunchAgent) async {
+        let dir = NSHomeDirectory() + "/Library/LaunchAgents"
+        for f in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [] where f.hasSuffix(".\(suffix).auto.plist") {
+            let label = String(f.dropLast(6))
+            guard label != current.label else { continue }
+            _ = await Shell.run("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+            try? FileManager.default.removeItem(atPath: dir + "/" + f)
+            UserDefaults.standard.set(true, forKey: "autoEnabled")
+        }
     }
 }
 

@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")"
 VER="$(cat VERSION)"
-app/build_bundle.sh "HY-WEP 체커" HywepChecker com.seongsu.hywepchecker HywepApp.swift briefcase.fill 1FB89A 0B7A62 "$PWD/build" "$VER" >/dev/null
+app/build_bundle.sh "HY-WEP 체커" HywepChecker io.github.anrqkdrnl.hywepchecker HywepApp.swift briefcase.fill 1FB89A 0B7A62 "$PWD/build" "$VER" >/dev/null
 APP="build/HY-WEP 체커.app"
 echo "빌드 완료: $APP (v$VER)"
 for a in "$@"; do

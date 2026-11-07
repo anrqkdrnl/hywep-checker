@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")"
 D="$HOME/.hywep_check"
-LABEL="com.seongsu.hywepcheck"
+LABEL="io.github.anrqkdrnl.hywepcheck"
 P="$HOME/Library/LaunchAgents/$LABEL.plist"
 RESET=0; NOAPP=0
 for a in "$@"; do

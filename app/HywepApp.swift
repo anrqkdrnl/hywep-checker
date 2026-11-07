@@ -10,7 +10,7 @@ let hyListURL = hyHome + "/compjoinsearch/list.do"
 let hyViewURL = hyHome + "/compjoinmanage/view_stu.do"
 let hyFiles = AppFiles("HY-WEP 체커")
 let hyCreds = Credentials(idService: "hyu-portal-id", pwService: "hyu-portal-pw")
-let hyAgent = LaunchAgent(label: "com.seongsu.hywepchecker.auto")
+let hyAgent = LaunchAgent(label: "io.github.anrqkdrnl.hywepchecker.auto")
 let hyResultFile = "latest.json"
 let hySeenFile = "seen.json"
 
@@ -695,7 +695,6 @@ struct HySettingsView: View {
         Form {
             CredentialSection(title: "한양대 포털 계정", creds: hyCreds)
             AutoRunSection(agent: hyAgent, action: "새 공고가 있으면 창을 띄워줘")
-            LegacySection(label: "com.seongsu.hywepcheck", folder: ".hywep_check")
             Section {
                 Button("기준 목록 초기화…", role: .destructive) { confirmReset = true }
                     .disabled(store.running != nil)
@@ -730,6 +729,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let args = CommandLine.arguments
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        Migration.defaults("hywepchecker")
         Notifier.shared.setUp()
         Windows.installMenu(appName: "HY-WEP 체커", target: self, settings: #selector(showSettings), refresh: #selector(refresh))
         store.openSettings = { [weak self] in self?.showSettings() }
@@ -744,7 +744,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         Task {
+            await Migration.agents("hywepchecker", current: hyAgent)
             await hyAgent.refreshIfMoved()
+            // 이미 허용/거부했으면 아무것도 안 뜸. 앱 ID가 바뀐 뒤 처음 열 때만 macOS가 다시 물어봄
+            if UserDefaults.standard.bool(forKey: "setupDone") { Notifier.shared.requestPermission() }
             if UserDefaults.standard.bool(forKey: "setupDone") { showMain() } else { showSetup() }
         }
     }

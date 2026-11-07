@@ -206,7 +206,7 @@ HY-WEP 사이트 구조가 바뀌었을 가능성이 커요. 이슈를 남겨 �
 
 **Q. 예전 터미널(Python) 버전을 쓰고 있었어요.**
 - 예전 버전에서 본 공고 기록(`~/.hywep_check/seen.json`)은 처음 실행할 때 자동으로 가져와요.
-- 설정 화면의 **예전 버전 자동 실행 끄기**를 누르면 팝업이 두 번 뜨지 않아요.
+- 예전 버전의 자동 실행을 끄지 않으면 팝업이 두 번 떠요. `~/Library/LaunchAgents`에 있는 예전 plist를 `launchctl bootout`으로 내리고 지워 주세요.
 - 예전 코드는 [`legacy-python/`](legacy-python/)에 있어요.
 
 ---
@@ -230,10 +230,10 @@ brew uninstall --zap --cask hywep-checker    # 앱 데이터와 설정까지 삭
 
    ```bash
    rm -rf ~/Library/Application\ Support/HY-WEP\ 체커
-   defaults delete com.seongsu.hywepchecker
+   defaults delete io.github.anrqkdrnl.hywepchecker
    security delete-generic-password -s hyu-portal-id; security delete-generic-password -s hyu-portal-pw
-   launchctl bootout gui/$(id -u)/com.seongsu.hywepchecker.auto 2>/dev/null
-   rm -f ~/Library/LaunchAgents/com.seongsu.hywepchecker.auto.plist
+   launchctl bootout gui/$(id -u)/io.github.anrqkdrnl.hywepchecker.auto 2>/dev/null
+   rm -f ~/Library/LaunchAgents/io.github.anrqkdrnl.hywepchecker.auto.plist
    ```
 
 ---
@@ -262,7 +262,7 @@ launchd (10분마다) → HY-WEP 체커 --auto → 확인 시각 회차 가드 �
 | `~/Library/Application Support/HY-WEP 체커/latest.json` | 마지막 결과 |
 | `~/Library/Application Support/HY-WEP 체커/seen.json` | 지금까지 본 공고 ID → 처음 발견한 날짜 |
 | `~/Library/Application Support/HY-WEP 체커/error.log` | 오류 기록 |
-| `~/Library/LaunchAgents/com.seongsu.hywepchecker.auto.plist` | 자동 실행 등록 |
+| `~/Library/LaunchAgents/io.github.anrqkdrnl.hywepchecker.auto.plist` | 자동 실행 등록 |
 | 키체인 `hyu-portal-id` / `hyu-portal-pw` | 포털 아이디 / 비밀번호 |
 
 ---
