@@ -1,6 +1,6 @@
 #!/bin/bash
 # 앱 빌드: ./build.sh            → build/HY-WEP 체커.app
-#         ./build.sh --install  → 빌드 후 /Applications 에 설치 (쓰기 권한 없으면 ~/Applications)
+#         ./build.sh --install  → 빌드 후 /Applications 에 설치하고 build/ 사본은 지움 (쓰기 권한 없으면 ~/Applications)
 #         ./build.sh --zip      → 배포용 zip (build/HywepChecker.zip)
 # 필요: Xcode (Command Line Tools만으로는 SwiftUI 매크로가 없어 빌드 실패)
 set -e
@@ -22,3 +22,5 @@ for a in "$@"; do
     echo "zip: build/HywepChecker.zip"
   fi
 done
+# 설치했으면 빌드 사본은 지움 (Spotlight·Launchpad에 앱이 두 개로 보이지 않게)
+case " $* " in *" --install "*) rm -rf "$APP" ;; esac

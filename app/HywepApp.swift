@@ -514,6 +514,15 @@ final class HyStore: ObservableObject {
     let detail = DetailController()
     let resume = ResumeController()
     private var loadedAt: Date?
+    /// 북마크한 공고 jid. 목록 맨 위에 뜸. 공고가 내려가도 기록은 남겨 둠(다시 올라오면 그대로 북마크).
+    @Published private(set) var bookmarks = Set(UserDefaults.standard.stringArray(forKey: "bookmarks") ?? [])
+
+    func isBookmarked(_ p: Posting) -> Bool { bookmarks.contains(p.jid) }
+
+    func toggleBookmark(_ p: Posting) {
+        if bookmarks.remove(p.jid) == nil { bookmarks.insert(p.jid) }
+        UserDefaults.standard.set(bookmarks.sorted(), forKey: "bookmarks")
+    }
 
     func load() {
         data = hyFiles.load(HyData.self, hyResultFile)
@@ -549,6 +558,7 @@ struct HyContentView: View {
     @State private var query = ""
     @State private var onlyNew = false
     @State private var hideClosed = true
+    @State private var onlyBookmarks = false
     @State private var selection: Posting.ID?
     @State private var sortOrder = [KeyPathComparator(\Posting.jidNum, order: .reverse)]
     let timer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
@@ -556,10 +566,12 @@ struct HyContentView: View {
     var rows: [Posting] {
         guard let d = store.data else { return [] }
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
-        return d.rows.filter { r in
-            (!onlyNew || r.is_new) && (!hideClosed || r.daysLeft >= 0) &&
+        let sorted = d.rows.filter { r in
+            (!onlyNew || r.is_new) && (!hideClosed || r.daysLeft >= 0) && (!onlyBookmarks || store.isBookmarked(r)) &&
                 (q.isEmpty || [r.comp, r.dept, r.major, r.loc, r.cat, r.type, r.sched].contains { $0.lowercased().contains(q) })
         }.sorted(using: sortOrder)
+        // 북마크한 공고는 정렬과 상관없이 맨 위 (그 안에서는 지금 정렬 순서 유지)
+        return sorted.filter(store.isBookmarked) + sorted.filter { !store.isBookmarked($0) }
     }
 
     var body: some View {
@@ -615,9 +627,10 @@ struct HyContentView: View {
                 .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 7))
                 .frame(maxWidth: 420)
                 Toggle("새 공고만", isOn: $onlyNew).toggleStyle(.checkbox)
+                Toggle("북마크만", isOn: $onlyBookmarks).toggleStyle(.checkbox)
                 Toggle("마감 지난 것 숨기기", isOn: $hideClosed).toggleStyle(.checkbox)
                 Spacer()
-                Text("공고를 클릭하면 상세 내용이 열려").font(.caption).foregroundStyle(.secondary)
+                Text("더블클릭: 상세 보기 · ☆: 북마크(맨 위 고정)").font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding()
@@ -635,6 +648,14 @@ struct HyContentView: View {
 
     var table: some View {
         Table(rows, selection: $selection, sortOrder: $sortOrder) {
+            TableColumn("") { r in
+                let on = store.isBookmarked(r)
+                Button { store.toggleBookmark(r) } label: {
+                    Image(systemName: on ? "star.fill" : "star").foregroundStyle(on ? .yellow : .secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(on ? "북마크 해제" : "북마크 (목록 맨 위에 고정)")
+            }.width(22)
             TableColumn("발견", value: \.found) { r in
                 if r.is_new {
                     Text("NEW").font(.caption.bold()).foregroundStyle(.white)
@@ -657,21 +678,21 @@ struct HyContentView: View {
             }.width(min: 120, ideal: 160)
             TableColumn("실습기간", value: \.period).width(min: 90, ideal: 150)
             TableColumn("지원금", value: \.pay).width(min: 60, ideal: 100)
-            TableColumn("모집전공", value: \.major) { r in Text(r.major).foregroundStyle(.secondary).help(r.major) }
-                .width(min: 100, ideal: 220)
-            TableColumn("모집/지원", value: \.quota) { r in Text("\(r.quota) / \(r.applied)").monospacedDigit() }
-                .width(min: 50, ideal: 64)
-            TableColumn("소재지", value: \.loc).width(min: 60, ideal: 90)
-            TableColumn("학기·분류", value: \.sched) { r in
-                Text("\(r.shortSched) · \(r.cat)").foregroundStyle(.secondary).help("\(r.sched)\n\(r.cat) · \(r.type)")
-            }.width(min: 90, ideal: 160)
-        }
-        .onChange(of: selection) { _, id in
-            if let p = posting(id) { store.detail.open(p) }
+            Group {
+                TableColumn("모집전공", value: \Posting.major) { r in Text(r.major).foregroundStyle(.secondary).help(r.major) }
+                    .width(min: 100, ideal: 220)
+                TableColumn("모집/지원", value: \Posting.quota) { r in Text("\(r.quota) / \(r.applied)").monospacedDigit() }
+                    .width(min: 50, ideal: 64)
+                TableColumn("소재지", value: \Posting.loc).width(min: 60, ideal: 90)
+                TableColumn("학기·분류", value: \Posting.sched) { r in
+                    Text("\(r.shortSched) · \(r.cat)").foregroundStyle(.secondary).help("\(r.sched)\n\(r.cat) · \(r.type)")
+                }.width(min: 90, ideal: 160)
+            }
         }
         .contextMenu(forSelectionType: Posting.ID.self) { ids in
             if let r = posting(ids.first) {
                 Button("공고 상세 보기") { store.detail.open(r) }
+                Button(store.isBookmarked(r) ? "북마크 해제" : "북마크") { store.toggleBookmark(r) }
                 if !r.home.isEmpty { Button("기관 홈페이지 열기") { openURL(r.home) } }
                 Button("기관명 복사") { copyToPasteboard(r.comp) }
             }
@@ -791,7 +812,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let view = SetupView(
             appName: "HY-WEP 체커", icon: "briefcase.fill", tint: .teal,
             features: ["HY-WEP 현장실습 접수중 공고를 한눈에 (검색·정렬·필터)", "새로 올라온 공고에 NEW 표시",
-                       "공고를 클릭하면 상세 내용을 앱 안에서 바로 확인", "정한 시각에 자동으로 확인해서 새 공고를 알려줌",
+                       "공고를 더블클릭하면 상세 내용을 앱 안에서 바로 확인", "정한 시각에 자동으로 확인해서 새 공고를 알려줌",
                        "자동 확인은 읽기 전용 — 신청은 내가 ‘지원하기’를 누를 때만"],
             accountTitle: "HY-WEP 학생 로그인에 쓰는 한양대 포털 계정을 입력해줘.",
             creds: hyCreds, agent: hyAgent,
