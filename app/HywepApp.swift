@@ -199,18 +199,58 @@ final class DetailController: ObservableObject {
     @Published var posting: Posting?
     /// 지원하기 결과 안내 (상단 표시)
     @Published var applyNote: String?
-    private var window: NSWindow?
+    private(set) var window: NSWindow?
     private var loadTask: Task<Void, Never>?
+    private var closeObserver: NSObjectProtocol?
+    /// 창이 닫히면 불림 (DetailWindows가 목록에서 지움)
+    var onClose: () -> Void = {}
 
-    func open(_ p: Posting) {
+    /// 공고 하나당 창 하나. 여러 창이 동시에 열려 있을 수 있음.
+    func open(_ p: Posting, cascadeFrom prev: NSWindow? = nil) {
         posting = p
         if window == nil {
-            window = Windows.make("공고 상세", size: NSSize(width: 980, height: 860), autosave: "detail", DetailView(ctl: self))
+            let w = Windows.make("공고 상세", size: NSSize(width: 980, height: 860), autosave: prev == nil ? "detail" : nil, DetailView(ctl: self))
+            if let prev {
+                // 이미 열린 창과 겹치지 않게 조금씩 비켜서 띄움
+                w.setContentSize(prev.contentLayoutRect.size)
+                w.setFrameTopLeftPoint(NSPoint(x: prev.frame.minX, y: prev.frame.maxY))
+                w.setFrameTopLeftPoint(w.cascadeTopLeft(from: NSPoint(x: prev.frame.minX, y: prev.frame.maxY)))
+            }
+            w.tabbingIdentifier = "hywep-detail"
+            closeObserver = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.closed() }
+            }
+            window = w
+            window!.title = "\(p.comp) · \(p.dept)"
+            Windows.present(window!)
+            loadTask = Task { await load(forceLogin: false) }
+        } else {
+            Windows.present(window!)
         }
-        window!.title = "\(p.comp) · \(p.dept)"
-        if window!.isVisible { window!.orderFront(nil) } else { Windows.present(window!) }
+    }
+
+    private func closed() {
         loadTask?.cancel()
-        loadTask = Task { await load(forceLogin: false) }
+        web.webView.stopLoading()
+        if let o = closeObserver { NotificationCenter.default.removeObserver(o) }
+        closeObserver = nil
+        window?.contentView = nil
+        window = nil
+        onClose()
+    }
+
+    /// 여러 창이 동시에 열릴 때 로그인을 한 번만 하도록 묶음 (같은 쿠키 저장소를 씀)
+    private static var loginInFlight: Task<Void, Error>?
+
+    static func ensureLogin(_ web: WebSession) async throws {
+        if let t = loginInFlight { return try await t.value }
+        let t = Task { @MainActor in
+            guard let (u, pw) = await hyCreds.load() else { throw WebError.noCredentials }
+            try await HyEngine.login(web, u, pw)
+        }
+        loginInFlight = t
+        defer { loginInFlight = nil }
+        try await t.value
     }
 
     func reload(forceLogin: Bool) {
@@ -226,8 +266,7 @@ final class DetailController: ObservableObject {
         do {
             if forceLogin || !HyEngine.sessionFresh {
                 status = "HY-WEP 로그인 중…"
-                guard let (u, pw) = await hyCreds.load() else { throw WebError.noCredentials }
-                try await HyEngine.login(web, u, pw)
+                try await Self.ensureLogin(web)
                 if Task.isCancelled { return }
             }
             status = "공고 여는 중…"
@@ -396,6 +435,26 @@ struct DetailView: View {
     }
 }
 
+/// 공고 상세 창들. 같은 공고를 다시 열면 그 창을 앞으로, 다른 공고는 새 창으로 엶.
+@MainActor
+final class DetailWindows {
+    private var open: [String: DetailController] = [:]
+    private var order: [String] = []
+
+    func open(_ p: Posting) {
+        if let c = open[p.jid] { c.open(p); return }
+        let prev = order.last.flatMap { open[$0]?.window }
+        let c = DetailController()
+        c.onClose = { [weak self] in
+            self?.open[p.jid] = nil
+            self?.order.removeAll { $0 == p.jid }
+        }
+        open[p.jid] = c
+        order.append(p.jid)
+        c.open(p, cascadeFrom: prev)
+    }
+}
+
 // MARK: - 이력서 수정 창 (MY PAGE → 이력서 작성 버튼 경유. 직접 주소로 들어가면 사이트가 막음)
 
 @MainActor
@@ -511,7 +570,7 @@ final class HyStore: ObservableObject {
     @Published var runMessage = ""
     @Published var error: String?
     var openSettings: () -> Void = {}
-    let detail = DetailController()
+    let detail = DetailWindows()
     let resume = ResumeController()
     private var loadedAt: Date?
     /// 북마크한 공고 jid. 목록 맨 위에 뜸. 공고가 내려가도 기록은 남겨 둠(다시 올라오면 그대로 북마크).
@@ -559,7 +618,7 @@ struct HyContentView: View {
     @State private var onlyNew = false
     @State private var hideClosed = true
     @State private var onlyBookmarks = false
-    @State private var selection: Posting.ID?
+    @State private var selection = Set<Posting.ID>()
     @State private var sortOrder = [KeyPathComparator(\Posting.jidNum, order: .reverse)]
     let timer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
@@ -690,14 +749,16 @@ struct HyContentView: View {
             }
         }
         .contextMenu(forSelectionType: Posting.ID.self) { ids in
-            if let r = posting(ids.first) {
+            if ids.count > 1 {
+                Button("공고 상세 \(ids.count)개 열기") { for id in ids { if let r = posting(id) { store.detail.open(r) } } }
+            } else if let r = posting(ids.first) {
                 Button("공고 상세 보기") { store.detail.open(r) }
                 Button(store.isBookmarked(r) ? "북마크 해제" : "북마크") { store.toggleBookmark(r) }
                 if !r.home.isEmpty { Button("기관 홈페이지 열기") { openURL(r.home) } }
                 Button("기관명 복사") { copyToPasteboard(r.comp) }
             }
         } primaryAction: { ids in
-            if let r = posting(ids.first) { store.detail.open(r) }
+            for id in ids { if let r = posting(id) { store.detail.open(r) } }
         }
     }
 
