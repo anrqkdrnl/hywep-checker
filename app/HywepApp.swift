@@ -3,6 +3,7 @@
 import AppKit
 import SwiftUI
 import Combine
+import WebKit
 
 let hyHome = "https://hywep.hanyang.ac.kr"
 let hyIndexURL = hyHome + "/index.do"
@@ -199,11 +200,15 @@ final class DetailController: ObservableObject {
     @Published var posting: Posting?
     /// 지원하기 결과 안내 (상단 표시)
     @Published var applyNote: String?
+    /// 스크린샷 저장 결과 (상단 표시)
+    @Published var shotNote: (text: String, file: URL?)?
     private(set) var window: NSWindow?
     private var loadTask: Task<Void, Never>?
     private var closeObserver: NSObjectProtocol?
     /// 창이 닫히면 불림 (DetailWindows가 목록에서 지움)
     var onClose: () -> Void = {}
+    /// 북마크 버튼용 (셀프테스트처럼 없으면 버튼을 숨김)
+    weak var store: HyStore?
 
     /// 공고 하나당 창 하나. 여러 창이 동시에 열려 있을 수 있음.
     func open(_ p: Posting, cascadeFrom prev: NSWindow? = nil) {
@@ -375,6 +380,82 @@ extension DetailController {
     }
 }
 
+// MARK: - 공고 스크린샷 (페이지 전체를 PNG로)
+
+enum ShotFolder {
+    static let key = "screenshotDir"
+    static var url: URL? {
+        get { UserDefaults.standard.string(forKey: key).map { URL(fileURLWithPath: $0, isDirectory: true) } }
+        set { UserDefaults.standard.set(newValue?.path, forKey: key) }
+    }
+
+    /// 폴더 고르기 창. 고르면 저장하고 돌려줌.
+    @MainActor static func choose() -> URL? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "이 폴더에 저장"
+        panel.message = "공고 스크린샷을 저장할 폴더를 골라줘"
+        panel.directoryURL = url ?? FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
+        guard panel.runModal() == .OK, let u = panel.url else { return nil }
+        url = u
+        return u
+    }
+
+    static var displayName: String {
+        guard let u = url else { return "지정 안 됨" }
+        return (u.path as NSString).abbreviatingWithTildeInPath
+    }
+}
+
+extension DetailController {
+    /// 지금 창에 열린 공고 페이지 전체를 PNG로 저장. 폴더가 없으면 먼저 고르게 함.
+    func saveScreenshot(to folder: URL? = nil) async {
+        guard let p = posting else { return }
+        guard let dir = folder ?? ShotFolder.url ?? ShotFolder.choose() else { return }
+        do {
+            guard web.url.contains("view_stu.do") else { throw WebError.other("공고 페이지가 열린 뒤에 찍어줘.") }
+            let png = try await Self.fullPagePNG(web.webView)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let day = { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f.string(from: Date()) }()
+            let bad = CharacterSet(charactersIn: "/\\:*?\"<>|\n\r\t")
+            let clean = { (x: String) in x.components(separatedBy: bad).joined(separator: " ").trimmingCharacters(in: .whitespaces) }
+            var name = [clean(p.comp), clean(p.dept)].filter { !$0.isEmpty }.joined(separator: " - ")
+            if name.count > 80 { name = String(name.prefix(80)) }
+            let file = dir.appendingPathComponent("\(name) (\(p.jid), \(day)).png")
+            try png.write(to: file, options: .atomic)
+            shotNote = ("저장했어: \(file.lastPathComponent)", file)
+        } catch {
+            shotNote = ("스크린샷 저장 실패: \(error.message)", nil)
+        }
+    }
+
+    /// WKWebView 내용 전체(스크롤 아래까지)를 한 장의 PNG로. createPDF로 전체를 받은 뒤 2배 해상도로 그림.
+    static func fullPagePNG(_ wv: WKWebView) async throws -> Data {
+        let pdf: Data = try await withCheckedThrowingContinuation { cont in
+            wv.createPDF(configuration: WKPDFConfiguration()) { cont.resume(with: $0) }
+        }
+        guard let rep = NSPDFImageRep(data: pdf), rep.pageCount > 0 else { throw WebError.other("페이지를 그리지 못했어.") }
+        let size = rep.bounds.size
+        let scale: CGFloat = 2
+        guard let bmp = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else {
+            throw WebError.other("이미지를 만들지 못했어.")
+        }
+        bmp.size = size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bmp)
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: size).fill()
+        rep.draw(in: NSRect(origin: .zero, size: size))
+        NSGraphicsContext.restoreGraphicsState()
+        guard let png = bmp.representation(using: .png, properties: [:]) else { throw WebError.other("PNG로 바꾸지 못했어.") }
+        return png
+    }
+}
+
 struct DetailView: View {
     @ObservedObject var ctl: DetailController
 
@@ -387,9 +468,26 @@ struct DetailView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+                if let store = ctl.store, let p = ctl.posting {
+                    DetailBookmarkButton(store: store, posting: p)
+                }
                 if let h = ctl.posting?.home, !h.isEmpty {
                     Button { openURL(h) } label: { Label("기관 홈페이지", systemImage: "building.2") }
                 }
+                Menu {
+                    Text("저장 폴더: \(ShotFolder.displayName)")
+                    Button("저장 폴더 바꾸기…") { if ShotFolder.choose() != nil { Task { await ctl.saveScreenshot() } } }
+                    if let u = ShotFolder.url {
+                        Button("저장 폴더 열기") { NSWorkspace.shared.open(u) }
+                    }
+                } label: {
+                    Label("스크린샷", systemImage: "camera")
+                } primaryAction: {
+                    Task { await ctl.saveScreenshot() }
+                }
+                .fixedSize()
+                .disabled(ctl.status != nil)
+                .help("공고 페이지 전체를 PNG로 저장해. 오른쪽 ▾에서 저장 폴더를 바꿀 수 있어")
                 Button { Task { await ctl.apply() } } label: { Label("지원하기", systemImage: "paperplane.fill") }
                     .buttonStyle(.borderedProminent).tint(.teal)
                     .disabled(ctl.status != nil && !ctl.failed)
@@ -398,6 +496,20 @@ struct DetailView: View {
                     .help("로그인이 풀렸으면 다시 로그인해서 열어")
             }
             .padding(10)
+            if let n = ctl.shotNote {
+                HStack(spacing: 8) {
+                    Image(systemName: n.file == nil ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .foregroundStyle(n.file == nil ? .orange : .green)
+                    Text(n.text).font(.callout).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    if let f = n.file {
+                        Button("Finder에서 보기") { NSWorkspace.shared.activateFileViewerSelecting([f]) }
+                    }
+                    Button { ctl.shotNote = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
+                }
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background((n.file == nil ? Color.orange : Color.green).opacity(0.12))
+            }
             if let n = ctl.applyNote {
                 HStack(spacing: 8) {
                     Image(systemName: "hand.point.right.fill").foregroundStyle(.orange)
@@ -438,6 +550,7 @@ struct DetailView: View {
 /// 공고 상세 창들. 같은 공고를 다시 열면 그 창을 앞으로, 다른 공고는 새 창으로 엶.
 @MainActor
 final class DetailWindows {
+    weak var store: HyStore?
     private var open: [String: DetailController] = [:]
     private var order: [String] = []
 
@@ -445,6 +558,7 @@ final class DetailWindows {
         if let c = open[p.jid] { c.open(p); return }
         let prev = order.last.flatMap { open[$0]?.window }
         let c = DetailController()
+        c.store = store
         c.onClose = { [weak self] in
             self?.open[p.jid] = nil
             self?.order.removeAll { $0 == p.jid }
@@ -452,6 +566,24 @@ final class DetailWindows {
         open[p.jid] = c
         order.append(p.jid)
         c.open(p, cascadeFrom: prev)
+    }
+}
+
+/// 상세 창 맨 위 북마크 버튼. 목록의 북마크와 같은 값을 씀.
+struct DetailBookmarkButton: View {
+    @ObservedObject var store: HyStore
+    let posting: Posting
+
+    var body: some View {
+        let on = store.isBookmarked(posting)
+        Button { store.toggleBookmark(posting) } label: {
+            Label {
+                Text(on ? "북마크됨" : "북마크")
+            } icon: {
+                Image(systemName: on ? "star.fill" : "star").foregroundStyle(on ? .yellow : .secondary)
+            }
+        }
+        .help(on ? "북마크 해제" : "북마크하면 목록 맨 위에 고정돼")
     }
 }
 
@@ -572,6 +704,8 @@ final class HyStore: ObservableObject {
     var openSettings: () -> Void = {}
     let detail = DetailWindows()
     let resume = ResumeController()
+
+    init() { detail.store = self }
     private var loadedAt: Date?
     /// 북마크한 공고 jid. 목록 맨 위에 뜸. 공고가 내려가도 기록은 남겨 둠(다시 올라오면 그대로 북마크).
     @Published private(set) var bookmarks = Set(UserDefaults.standard.stringArray(forKey: "bookmarks") ?? [])
@@ -980,6 +1114,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try await Task.sleep(nanoseconds: 1_000_000_000)
                 let text = (try? await d.web.js("return document.body.innerText.slice(0, 400);")) as? String ?? ""
                 print("DETAIL url=\(d.web.url) status=\(d.status ?? "ok") alerts=\(d.web.alerts)\n\(text)")
+                if let i = args.firstIndex(of: "--shot"), i + 1 < args.count {
+                    await d.saveScreenshot(to: URL(fileURLWithPath: args[i + 1], isDirectory: true))
+                    print("SHOT \(d.shotNote?.text ?? "-") \(d.shotNote?.file?.path ?? "")")
+                }
             }
         } catch {
             print("FAIL", error.message)
